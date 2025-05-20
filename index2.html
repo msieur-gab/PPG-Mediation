@@ -1,246 +1,4 @@
-// Start interactive positioning phase
-    async function startPositioning() {
-      // Clear any existing timers
-      if (frameProcessorId) cancelAnimationFrame(frameProcessorId);
-      
-      // Initialize state
-      positioning = true;
-      measuring = false;
-      redValuesBuffer = [];
-      dataPoints = [];
-      goodSignalStartTime = 0;
-      
-      // Update UI
-      initialState.classList.add('hidden');
-      resultsState.classList.add('hidden');
-      measuringState.classList.add('hidden');
-      positioningState.classList.remove('hidden');
-      cameraError.classList.add('hidden');
-      
-      try {
-        // Start camera
-        const cameraStarted = await startCameraWithFacing(cameraFacing);
-        
-        if (!cameraStarted) {
-          stopPositioning();
-          initialState.classList.remove('hidden');
-          return;
-        }
-        
-        // Start processing frames for positioning
-        frameProcessorId = requestAnimationFrame(processPositioningFrame);
-        
-      } catch (error) {
-        console.error('Error starting positioning:', error);
-        showCameraError('An error occurred. Please try again.');
-        stopPositioning();
-        initialState.classList.remove('hidden');
-      }
-    }
-    
-    // Start the actual measurement phase
-    function startMeasuring() {
-      // Stop positioning phase
-      positioning = false;
-      if (frameProcessorId) {
-        cancelAnimationFrame(frameProcessorId);
-        frameProcessorId = null;
-      }
-      
-      // Auto-enable flash for measurement if supported
-      if (flashSupported && !flashActive) {
-        toggleFlash();
-      }
-      
-      // Initialize measurement state
-      measuring = true;
-      countdown = 5;
-      redValuesBuffer = [];
-      dataPoints = [];
-      measurementNumber = 0;
-      individualReadings = [];
-      detectedPeaks = [];
-      
-      // Update UI
-      positioningState.classList.add('hidden');
-      measuringState.classList.remove('hidden');
-      
-      countdownElement.textContent = countdown;
-      countdownElement.classList.add('pulse');
-      clearVisualization();
-      updateMeasurementIndicators();
-      clearReadings();
-      
-      // Begin countdown
-      countdownTimer = setInterval(() => {
-        countdown--;
-        countdownElement.textContent = countdown;
-        
-        if (countdown <= 0) {
-          clearInterval(countdownTimer);
-          countdownTimer = null;
-          countdownElement.classList.remove('pulse');
-          measurementNumber = 1;
-          startSingleMeasurement();
-        }
-      }, 1000);
-    }
-    
-    // Stop positioning phase
-    function stopPositioning() {
-      positioning = false;
-      
-      if (frameProcessorId) {
-        cancelAnimationFrame(frameProcessorId);
-        frameProcessorId = null;
-      }
-      
-      // Turn off flash
-      if (flashActive && stream) {
-        const track = stream.getVideoTracks()[0];
-        if (track) {
-          track.applyConstraints({ advanced: [{ torch: false }] });
-          flashActive = false;
-        }
-      }
-      
-      // Stop video stream
-      if (stream) {
-        stream.getTracks().forEach(track => track.stop());
-        stream = null;
-      }
-      
-      flashToggleBtn.classList.add('hidden');
-    }    // Process video frame during positioning phase
-    function processPositioningFrame() {
-      if (!processingVideo || !processingCanvas || !positioning || !stream || processingVideo.paused) return;
-      
-      const video = processingVideo;
-      const canvas = processingCanvas;
-      const ctx = canvas.getContext('2d', { willReadFrequently: true });
-      
-      // Ensure canvas size is correct
-      if (canvas.width !== 150 || canvas.height !== 150) {
-        canvas.width = 150;
-        canvas.height = 150;
-      }
-      
-      if (video.videoWidth > 0 && video.videoHeight > 0) {
-        // Draw center crop from video to canvas
-        const srcX = (video.videoWidth - canvas.width) / 2;
-        const srcY = (video.videoHeight - canvas.height) / 2;
-        ctx.drawImage(video, srcX, srcY, canvas.width, canvas.height, 0, 0, canvas.width, canvas.height);
-        
-        // Extract values from center ROI
-        const roiX = canvas.width / 2 - 20;
-        const roiY = canvas.height / 2 - 20;
-        const roiWidth = 40;
-        const roiHeight = 40;
-        const pixelData = ctx.getImageData(roiX, roiY, roiWidth, roiHeight).data;
-        
-        // Calculate RGB values and signal quality metrics
-        let totalRed = 0, totalGreen = 0, totalBlue = 0;
-        let pixelCount = 0;
-        
-        for (let i = 0; i < pixelData.length; i += 4) {
-          totalRed += pixelData[i];
-          totalGreen += pixelData[i + 1];
-          totalBlue += pixelData[i + 2];
-          pixelCount++;
-        }
-        
-        const avgRed = pixelCount > 0 ? totalRed / pixelCount : 0;
-        const avgGreen = pixelCount > 0 ? totalGreen / pixelCount : 0;
-        const avgBlue = pixelCount > 0 ? totalBlue / pixelCount : 0;
-        
-        // Add to buffer and maintain size for visualization
-        redValuesBuffer.push(avgRed);
-        if (redValuesBuffer.length > 30) { // Show last second of data during positioning
-          redValuesBuffer.shift();
-        }
-        
-        // Calculate signal quality metrics
-        // 1. Red channel should be high (finger is present)
-        // 2. Red should dominate over other channels (proper illumination)
-        // 3. Values should be stable over time (finger is steady)
-        
-        // Finger presence detection (based on red value)
-        const fingerPresent = avgRed > 150;
-        
-        // Red channel dominance
-        const redDominance = (avgRed > 0) ? 
-          (avgRed - Math.max(avgGreen, avgBlue)) / avgRed : 0;
-        
-        // Signal stability (low variation in last few frames)
-        let stability = 1.0;
-        if (redValuesBuffer.length > 10) {
-          const recent = redValuesBuffer.slice(-10);
-          const mean = recent.reduce((a, b) => a + b, 0) / recent.length;
-          const variance = recent.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / recent.length;
-          const standardDeviation = Math.sqrt(variance);
-          // Higher standard deviation = less stable = lower quality
-          stability = Math.max(0, 1 - (standardDeviation / 50));
-        }
-        
-        // Overall signal quality (weighted combination)
-        let signalQuality = 0;
-        if (fingerPresent) {
-          signalQuality = 0.4 * Math.min(avgRed / 220, 1) + // Red brightness
-                          0.3 * redDominance + // Red dominance
-                          0.3 * stability; // Signal stability
-        }
-        
-        // Update quality meter
-        qualityFill.style.width = `${signalQuality * 100}%`;
-        if (signalQuality > GOOD_SIGNAL_THRESHOLD) {
-          qualityFill.className = 'quality-fill good';
-          positioningMessage.textContent = "Great! Hold steady...";
-          
-          // Check if good signal has been maintained
-          const now = Date.now();
-          if (goodSignalStartTime === 0) {
-            goodSignalStartTime = now;
-          } else if (now - goodSignalStartTime > GOOD_SIGNAL_DURATION * 1000) {
-            // Auto-start measurement after sustained good signal
-            startMeasuring();
-            return;
-          }
-        } else if (signalQuality > FAIR_SIGNAL_THRESHOLD) {
-          qualityFill.className = 'quality-fill fair';
-          positioningMessage.textContent = "Almost there...adjust position slightly";
-          goodSignalStartTime = 0; // Reset good signal timer
-        } else if (fingerPresent) {
-          qualityFill.className = 'quality-fill';
-          positioningMessage.textContent = "Reposition your finger in the red box";
-          goodSignalStartTime = 0; // Reset good signal timer
-        } else {
-          qualityFill.className = 'quality-fill';
-          qualityFill.style.width = "0%";
-          positioningMessage.textContent = "Place your finger over the camera";
-          goodSignalStartTime = 0; // Reset good signal timer
-        }
-        
-        // Update data for visualization
-        dataPoints = [...redValuesBuffer];
-        updateVisualization();
-      }
-      
-      // Draw ROI box on preview
-      if (previewCanvas) {
-        const previewCtx = previewCanvas.getContext('2d');
-        previewCtx.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
-        previewCtx.strokeStyle = 'red';
-        previewCtx.lineWidth = 2;
-        const previewRoiX = previewCanvas.width / 2 - 20;
-        const previewRoiY = previewCanvas.height / 2 - 20;
-        previewCtx.strokeRect(previewRoiX, previewRoiY, 40, 40);
-      }
-      
-      // Continue processing frames
-      if (positioning) {
-        frameProcessorId = requestAnimationFrame(processPositioningFrame);
-      }
-    }<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -360,6 +118,51 @@
       font-size: 0.75rem;
       color: #6b7280;
       margin-top: 4px;
+    }
+    
+    /* Signal quality indicator */
+    .signal-quality-meter {
+      width: 100%;
+      height: 8px;
+      background-color: #e5e7eb;
+      border-radius: 4px;
+      margin: 8px 0;
+      overflow: hidden;
+    }
+    
+    .quality-fill {
+      height: 100%;
+      background-color: #ef4444; /* Red by default */
+      width: 0%;
+      transition: width 0.3s ease, background-color 0.3s ease;
+    }
+    
+    .quality-fill.fair {
+      background-color: #f59e0b; /* Amber for fair quality */
+    }
+    
+    .quality-fill.good {
+      background-color: #10b981; /* Green for good quality */
+    }
+    
+    .positioning-message {
+      font-size: 0.875rem;
+      color: #374151;
+      margin-top: 8px;
+      text-align: center;
+    }
+    
+    /* Target area */
+    .target-area {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 60px;
+      height: 60px;
+      border: 2px dashed #f87171;
+      border-radius: 8px;
+      z-index: 2;
     }
     
     /* Countdown */
@@ -676,6 +479,7 @@
     </div>
     
     <div class="card" id="mainCard">
+      <!-- Initial State -->
       <div id="initialState">
         <div class="camera-icon">
           <svg class="icon icon-lg" viewBox="0 0 24 24">
@@ -700,6 +504,7 @@
         <button id="startMeasurementBtn" class="btn btn-primary">Start Measurement</button>
       </div>
       
+      <!-- Positioning State (helps user position finger correctly) -->
       <div id="positioningState" class="hidden">
         <div class="preview-container" id="previewContainer">
           <video id="previewVideo" class="camera-preview" playsinline muted autoplay></video>
@@ -727,20 +532,12 @@
         </button>
       </div>
       
+      <!-- Measuring State (when actual measurement is taking place) -->
       <div id="measuringState" class="hidden">
-        <div class="preview-container" id="previewContainer">
-          <video id="previewVideo" class="camera-preview" playsinline muted autoplay></video>
-          <canvas id="previewCanvas" class="preview-overlay" width="128" height="128"></canvas>
-          <div class="target-area"></div>
-          <div class="preview-help">Center your fingertip in the red box</div>
+        <div class="preview-container">
+          <video id="measureVideo" class="camera-preview" playsinline muted autoplay></video>
+          <canvas id="measureCanvas" class="preview-overlay" width="128" height="128"></canvas>
         </div>
-
-        <button id="flashToggleBtn" class="flash-toggle btn btn-link hidden">
-            <svg class="icon icon-sm" viewBox="0 0 24 24" id="flashIcon">
-                <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
-            </svg>
-            <span id="flashToggleText">Turn Flash On</span>
-        </button>
         
         <div id="countdown" class="countdown pulse">5</div>
         <p class="keep-steady">Keep your thumb steady...</p>
@@ -756,6 +553,7 @@
         <div id="visualization" class="visualization"></div>
       </div>
       
+      <!-- Results State (showing heart rate and tempo) -->
       <div id="resultsState" class="hidden">
         <div class="heart-rate">
           <svg class="icon" viewBox="0 0 24 24">
@@ -798,6 +596,7 @@
       </div>
     </div>
     
+    <!-- Meditation Progress Section -->
     <div id="meditationSection" class="meditation-section hidden">
       <div class="progress-bar">
         <div id="progressFill" class="progress-fill" style="width: 0%"></div>
@@ -824,61 +623,78 @@
   </div>
 
   <script>
-    // Configuration
+    // =================== CONFIGURATION ===================
     const FPS = 30;
     const MEASUREMENT_DURATION = 8; // seconds
     const BUFFER_SIZE = FPS * MEASUREMENT_DURATION;
     const TOTAL_MEASUREMENTS = 3;
     const FAILED_MEASUREMENT_TEXT = "Failed"; 
-    const SMOOTHING_WINDOW_SIZE = 5; // Reduced for better peak detection
-    const MIN_BPM = 45;
-    const MAX_BPM = 190;
+    const SMOOTHING_WINDOW_SIZE = 5; // For noise reduction
+    const MIN_BPM = 45;  // Minimum physiological heart rate
+    const MAX_BPM = 190; // Maximum physiological heart rate
     const GOOD_SIGNAL_THRESHOLD = 0.85; // 85% quality for good signal
     const FAIR_SIGNAL_THRESHOLD = 0.5;  // 50% quality for fair signal
     const GOOD_SIGNAL_DURATION = 1.5;   // Seconds of good signal before auto-starting
 
-    // State variables
-    let measuring = false;
-    let positioning = false;
-    let heartRate = null;
-    let recommendedTempo = null;
-    let countdown = 5;
-    let meditationActive = false;
-    let progress = 0;
-    let dataPoints = [];
-    let stream = null;
-    let measurementNumber = 0;
-    let individualReadings = []; 
-    let cameraFacing = 'environment'; 
-    let availableCameras = [];
-    let flashSupported = false;
-    let flashActive = false;
+    // =================== STATE VARIABLES ===================
+    let positioning = false;   // In positioning phase  
+    let measuring = false;     // In measurement phase
+    let heartRate = null;      // Final calculated heart rate
+    let recommendedTempo = null; // Derived from heart rate
+    let countdown = 5;         // Countdown to start measurement
+    let meditationActive = false; // Meditation session active
+    let progress = 0;          // Meditation progress percentage
+    
+    let stream = null;         // Camera stream
+    let cameraFacing = 'environment'; // Default camera
+    let availableCameras = []; // Available cameras list
+    let flashSupported = false; // Flash capability
+    let flashActive = false;    // Flash is on
+    
+    let dataPoints = [];        // Data for visualization
+    let redValuesBuffer = [];   // Raw signal data buffer
+    let detectedPeaks = [];     // Peaks for visualization
+    let measurementNumber = 0;  // Current measurement index
+    let individualReadings = []; // Readings from measurements
+    let goodSignalStartTime = 0; // When good signal was first detected
+    
+    // Timers
     let countdownTimer = null;
     let measurementTimer = null;
     let frameProcessorId = null;
     let animationId = null;
-    let goodSignalStartTime = 0; // When good signal was first detected
     
-    // DOM elements
+    // =================== DOM ELEMENTS ===================
+    // State containers
     const initialState = document.getElementById('initialState');
     const positioningState = document.getElementById('positioningState');
     const measuringState = document.getElementById('measuringState');
     const resultsState = document.getElementById('resultsState');
     const meditationSection = document.getElementById('meditationSection');
     
+    // Video elements
     const processingVideo = document.getElementById('processingVideo');
     const processingCanvas = document.getElementById('processingCanvas');
     const previewVideo = document.getElementById('previewVideo');
     const previewCanvas = document.getElementById('previewCanvas');
+    const measureVideo = document.getElementById('measureVideo');
+    const measureCanvas = document.getElementById('measureCanvas');
     
+    // Controls
     const startMeasurementBtn = document.getElementById('startMeasurementBtn');
     const cameraToggle = document.getElementById('cameraToggle');
     const cameraError = document.getElementById('cameraError');
+    const flashToggleBtn = document.getElementById('flashToggleBtn'); 
+    const flashToggleText = document.getElementById('flashToggleText');
+    const skipPositioningBtn = document.getElementById('skipPositioningBtn');
+    
+    // Measurement UI elements
     const countdownElement = document.getElementById('countdown');
     const measurementIndicators = document.getElementById('measurementIndicators');
     const readings = document.getElementById('readings');
     const visualization = document.getElementById('visualization');
     
+    // Results UI elements
     const heartRateValue = document.getElementById('heartRateValue');
     const resultReadings = document.getElementById('resultReadings');
     const tempoValue = document.getElementById('tempoValue');
@@ -886,19 +702,15 @@
     const startSessionBtn = document.getElementById('startSessionBtn');
     const endSessionBtn = document.getElementById('endSessionBtn');
     
+    // Meditation UI elements
     const progressFill = document.getElementById('progressFill');
     const currentTempo = document.getElementById('currentTempo');
-
-    const flashToggleBtn = document.getElementById('flashToggleBtn'); 
-    const flashToggleText = document.getElementById('flashToggleText');
     
+    // Positioning UI elements
     const qualityFill = document.getElementById('qualityFill');
     const positioningMessage = document.getElementById('positioningMessage');
-    const skipPositioningBtn = document.getElementById('skipPositioningBtn');
     
-    // Variables for processing
-    let redValuesBuffer = [];
-    let detectedPeaks = [];
+    // =================== CAMERA MANAGEMENT ===================
     
     // Check available cameras on page load
     async function checkCameras() {
@@ -911,10 +723,10 @@
         const devices = await navigator.mediaDevices.enumerateDevices();
         availableCameras = devices.filter(device => device.kind === 'videoinput');
         
-        // Show camera toggle if multiple cameras
+        // Show camera toggle if multiple cameras available
         cameraToggle.classList.toggle('hidden', availableCameras.length <= 1);
         
-        // Set default camera facing
+        // Set default camera facing mode
         if (availableCameras.length === 1) {
           const caps = availableCameras[0].getCapabilities ? availableCameras[0].getCapabilities() : null;
           if (caps && caps.facingMode && caps.facingMode.includes('user')) {
@@ -964,41 +776,21 @@
       flashActive = false;
       updateFlashButtonUI();
       
-      // Restart camera if currently measuring
-      if (measuring) {
+      // Restart camera if currently in use
+      if (positioning || measuring) {
         try {
           await startCameraWithFacing(cameraFacing);
         } catch (err) {
           console.error("Error switching camera:", err);
           showCameraError("Failed to switch camera. Try remeasuring.");
+          
+          // Return to initial state on error
+          stopPositioning();
           stopMeasuring();
           initialState.classList.remove('hidden');
+          positioningState.classList.add('hidden');
           measuringState.classList.add('hidden');
         }
-      }
-    }
-
-    // Update flash button visibility and text
-    function updateFlashButtonUI() {
-      flashToggleBtn.classList.toggle('hidden', !flashSupported || !measuring);
-      flashToggleText.textContent = flashActive ? 'Turn Flash Off' : 'Turn Flash On';
-    }
-
-    // Toggle flash on/off
-    async function toggleFlash() {
-      if (!stream || !flashSupported) return;
-      
-      const track = stream.getVideoTracks()[0];
-      if (!track) return;
-      
-      try {
-        flashActive = !flashActive;
-        await track.applyConstraints({ advanced: [{ torch: flashActive }] });
-        updateFlashButtonUI();
-      } catch (err) {
-        console.error("Flash toggle error:", err);
-        flashActive = !flashActive; // Revert state change
-        showCameraError("Could not control flash. Try a different camera.");
       }
     }
     
@@ -1025,13 +817,20 @@
         const mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
         stream = mediaStream;
         
-        // Set video sources
-        processingVideo.srcObject = mediaStream;
-        previewVideo.srcObject = mediaStream;
-        
-        // Start video playback
-        await processingVideo.play();
-        await previewVideo.play();
+        // Set video sources for all video elements
+        if (positioning) {
+          processingVideo.srcObject = mediaStream;
+          previewVideo.srcObject = mediaStream;
+          
+          await processingVideo.play();
+          await previewVideo.play();
+        } else if (measuring) {
+          processingVideo.srcObject = mediaStream;
+          measureVideo.srcObject = mediaStream;
+          
+          await processingVideo.play();
+          await measureVideo.play();
+        }
         
         // Check flash support
         const track = stream.getVideoTracks()[0];
@@ -1039,7 +838,7 @@
           const capabilities = track.getCapabilities();
           flashSupported = !!capabilities.torch;
           
-          // Show flash toggle
+          // Show flash toggle button if supported
           updateFlashButtonUI();
         }
         
@@ -1057,8 +856,8 @@
         
         showCameraError(errorMessage);
         
-        // Try front camera as fallback
-        if (facing === 'environment' && !error.name === 'NotAllowedError') {
+        // Try front camera as fallback for back camera errors
+        if (facing === 'environment' && error.name !== 'NotAllowedError') {
           try {
             console.log("Trying front camera as fallback");
             cameraFacing = 'user';
@@ -1077,6 +876,333 @@
     function showCameraError(message) {
       cameraError.textContent = message;
       cameraError.classList.remove('hidden');
+    }
+    
+    // Update flash button visibility and text
+    function updateFlashButtonUI() {
+      flashToggleBtn.classList.toggle('hidden', !flashSupported || (!positioning && !measuring));
+      flashToggleText.textContent = flashActive ? 'Turn Flash Off' : 'Turn Flash On';
+    }
+
+    // Toggle flash on/off
+    async function toggleFlash() {
+      if (!stream || !flashSupported) return;
+      
+      const track = stream.getVideoTracks()[0];
+      if (!track) return;
+      
+      try {
+        flashActive = !flashActive;
+        await track.applyConstraints({ advanced: [{ torch: flashActive }] });
+        updateFlashButtonUI();
+      } catch (err) {
+        console.error("Flash toggle error:", err);
+        flashActive = !flashActive; // Revert state change
+        showCameraError("Could not control flash. Try a different camera.");
+      }
+    }
+    
+    // =================== POSITIONING PHASE ===================
+    
+    // Start positioning phase (interactive guidance)
+    async function startPositioning() {
+      // Clear any existing timers
+      if (frameProcessorId) cancelAnimationFrame(frameProcessorId);
+      
+      // Initialize state
+      positioning = true;
+      measuring = false;
+      redValuesBuffer = [];
+      dataPoints = [];
+      goodSignalStartTime = 0;
+      
+      // Update UI
+      initialState.classList.add('hidden');
+      resultsState.classList.add('hidden');
+      measuringState.classList.add('hidden');
+      positioningState.classList.remove('hidden');
+      cameraError.classList.add('hidden');
+      
+      // Reset quality indicators
+      qualityFill.style.width = '0%';
+      qualityFill.className = 'quality-fill';
+      positioningMessage.textContent = 'Waiting for finger detection...';
+      
+      try {
+        // Start camera
+        const cameraStarted = await startCameraWithFacing(cameraFacing);
+        
+        if (!cameraStarted) {
+          stopPositioning();
+          initialState.classList.remove('hidden');
+          return;
+        }
+        
+        // Start processing frames for positioning
+        frameProcessorId = requestAnimationFrame(processPositioningFrame);
+        
+      } catch (error) {
+        console.error('Error starting positioning:', error);
+        showCameraError('An error occurred. Please try again.');
+        stopPositioning();
+        initialState.classList.remove('hidden');
+      }
+    }
+    
+    // Process video frame during positioning phase
+    function processPositioningFrame() {
+      if (!processingVideo || !processingCanvas || !positioning || !stream || processingVideo.paused) return;
+      
+      const video = processingVideo;
+      const canvas = processingCanvas;
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      
+      // Ensure canvas size is correct
+      if (canvas.width !== 150 || canvas.height !== 150) {
+        canvas.width = 150;
+        canvas.height = 150;
+      }
+      
+      if (video.videoWidth > 0 && video.videoHeight > 0) {
+        // Draw center crop from video to canvas
+        const srcX = (video.videoWidth - canvas.width) / 2;
+        const srcY = (video.videoHeight - canvas.height) / 2;
+        ctx.drawImage(video, srcX, srcY, canvas.width, canvas.height, 0, 0, canvas.width, canvas.height);
+        
+        // Extract values from center ROI
+        const roiX = canvas.width / 2 - 20;
+        const roiY = canvas.height / 2 - 20;
+        const roiWidth = 40;
+        const roiHeight = 40;
+        const pixelData = ctx.getImageData(roiX, roiY, roiWidth, roiHeight).data;
+        
+        // Calculate RGB values
+        let totalRed = 0, totalGreen = 0, totalBlue = 0;
+        let pixelCount = 0;
+        
+        for (let i = 0; i < pixelData.length; i += 4) {
+          totalRed += pixelData[i];
+          totalGreen += pixelData[i + 1];
+          totalBlue += pixelData[i + 2];
+          pixelCount++;
+        }
+        
+        const avgRed = pixelCount > 0 ? totalRed / pixelCount : 0;
+        const avgGreen = pixelCount > 0 ? totalGreen / pixelCount : 0;
+        const avgBlue = pixelCount > 0 ? totalBlue / pixelCount : 0;
+        
+        // Add to buffer for visualization
+        redValuesBuffer.push(avgRed);
+        if (redValuesBuffer.length > 30) { // Show just 1 second of data
+          redValuesBuffer.shift();
+        }
+        
+        // Calculate signal quality metrics
+        // 1. Red channel should be high (finger is present)
+        // 2. Red should dominate over other channels (proper illumination)
+        // 3. Values should be stable over time (finger is steady)
+        
+        // Finger presence detection (based on red value)
+        const fingerPresent = avgRed > 150;
+        
+        // Red channel dominance
+        const redDominance = (avgRed > 0) ? 
+          (avgRed - Math.max(avgGreen, avgBlue)) / avgRed : 0;
+        
+        // Signal stability (low variation in last few frames)
+        let stability = 1.0;
+        if (redValuesBuffer.length > 10) {
+          const recent = redValuesBuffer.slice(-10);
+          const mean = recent.reduce((a, b) => a + b, 0) / recent.length;
+          const variance = recent.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / recent.length;
+          const standardDeviation = Math.sqrt(variance);
+          // Higher standard deviation = less stable = lower quality
+          stability = Math.max(0, 1 - (standardDeviation / 50));
+        }
+        
+        // Overall signal quality (weighted combination)
+        let signalQuality = 0;
+        if (fingerPresent) {
+          signalQuality = 0.4 * Math.min(avgRed / 220, 1) + // Red brightness
+                          0.3 * redDominance +              // Red dominance
+                          0.3 * stability;                  // Signal stability
+        }
+        
+        // Update quality meter
+        qualityFill.style.width = `${signalQuality * 100}%`;
+        
+        // Update UI based on signal quality
+        if (signalQuality > GOOD_SIGNAL_THRESHOLD) {
+          qualityFill.className = 'quality-fill good';
+          positioningMessage.textContent = "Great! Hold steady...";
+          
+          // Check if good signal has been maintained
+          const now = Date.now();
+          if (goodSignalStartTime === 0) {
+            goodSignalStartTime = now;
+          } else if (now - goodSignalStartTime > GOOD_SIGNAL_DURATION * 1000) {
+            // Auto-start measurement after sustained good signal
+            startMeasuring();
+            return;
+          }
+        } else if (signalQuality > FAIR_SIGNAL_THRESHOLD) {
+          qualityFill.className = 'quality-fill fair';
+          positioningMessage.textContent = "Almost there...adjust position slightly";
+          goodSignalStartTime = 0; // Reset good signal timer
+        } else if (fingerPresent) {
+          qualityFill.className = 'quality-fill';
+          positioningMessage.textContent = "Reposition your finger in the red box";
+          goodSignalStartTime = 0; // Reset good signal timer
+        } else {
+          qualityFill.className = 'quality-fill';
+          qualityFill.style.width = "0%";
+          positioningMessage.textContent = "Place your finger over the camera";
+          goodSignalStartTime = 0; // Reset good signal timer
+        }
+        
+        // Update data for visualization
+        dataPoints = [...redValuesBuffer];
+        updateVisualization();
+      }
+      
+      // Draw ROI box on preview
+      if (previewCanvas) {
+        const previewCtx = previewCanvas.getContext('2d');
+        previewCtx.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
+        previewCtx.strokeStyle = 'red';
+        previewCtx.lineWidth = 2;
+        const previewRoiX = previewCanvas.width / 2 - 20;
+        const previewRoiY = previewCanvas.height / 2 - 20;
+        previewCtx.strokeRect(previewRoiX, previewRoiY, 40, 40);
+      }
+      
+      // Continue processing frames
+      if (positioning) {
+        frameProcessorId = requestAnimationFrame(processPositioningFrame);
+      }
+    }
+    
+    // Stop positioning phase
+    function stopPositioning() {
+      positioning = false;
+      
+      if (frameProcessorId) {
+        cancelAnimationFrame(frameProcessorId);
+        frameProcessorId = null;
+      }
+      
+      // Turn off flash
+      if (flashActive && stream) {
+        const track = stream.getVideoTracks()[0];
+        if (track) {
+          track.applyConstraints({ advanced: [{ torch: false }] });
+          flashActive = false;
+        }
+      }
+      
+      // Stop video stream
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+        stream = null;
+      }
+      
+      flashToggleBtn.classList.add('hidden');
+    }
+    
+    // =================== MEASUREMENT PHASE ===================
+    
+    // Start the actual measurement phase
+    function startMeasuring() {
+      // Stop positioning phase
+      stopPositioning();
+      
+      // Initialize measurement state
+      measuring = true;
+      countdown = 5;
+      redValuesBuffer = [];
+      dataPoints = [];
+      measurementNumber = 0;
+      individualReadings = [];
+      detectedPeaks = [];
+      
+      // Update UI
+      positioningState.classList.add('hidden');
+      measuringState.classList.remove('hidden');
+      
+      countdownElement.textContent = countdown;
+      countdownElement.classList.add('pulse');
+      clearVisualization();
+      updateMeasurementIndicators();
+      clearReadings();
+      
+      // Start camera for measurement
+      startCameraWithFacing(cameraFacing).then(success => {
+        if (!success) {
+          stopMeasuring();
+          initialState.classList.remove('hidden');
+          measuringState.classList.add('hidden');
+          return;
+        }
+        
+        // Auto-enable flash for measurement if supported
+        if (flashSupported && !flashActive) {
+          toggleFlash();
+        }
+        
+        // Begin countdown
+        countdownTimer = setInterval(() => {
+          countdown--;
+          countdownElement.textContent = countdown;
+          
+          if (countdown <= 0) {
+            clearInterval(countdownTimer);
+            countdownTimer = null;
+            countdownElement.classList.remove('pulse');
+            measurementNumber = 1;
+            startSingleMeasurement();
+          }
+        }, 1000);
+      });
+    }
+    
+    // Start a single measurement cycle
+    function startSingleMeasurement() {
+      // Update UI
+      countdownElement.textContent = `${measurementNumber}/${TOTAL_MEASUREMENTS}`;
+      updateMeasurementIndicators();
+      
+      // Reset data for this measurement
+      redValuesBuffer = [];
+      
+      // Start video processing
+      if (frameProcessorId) cancelAnimationFrame(frameProcessorId);
+      frameProcessorId = requestAnimationFrame(processFrame);
+      
+      // Schedule measurement completion
+      measurementTimer = setTimeout(() => {
+        // Stop frame processing
+        if (frameProcessorId) {
+          cancelAnimationFrame(frameProcessorId);
+          frameProcessorId = null;
+        }
+        
+        // Calculate heart rate
+        const hr = calculateHeartRate();
+        const newReading = (hr !== null) ? hr : FAILED_MEASUREMENT_TEXT;
+        individualReadings.push(newReading);
+        
+        // Update UI
+        updateReadings();
+        updateMeasurementIndicators();
+        
+        // Proceed to next measurement or finalize
+        if (measurementNumber < TOTAL_MEASUREMENTS) {
+          measurementNumber++;
+          setTimeout(() => startSingleMeasurement(), 1000);
+        } else {
+          finalizeMeasurements();
+        }
+      }, MEASUREMENT_DURATION * 1000);
     }
     
     // Process video frame to extract red channel average
@@ -1126,20 +1252,107 @@
         updateVisualization();
       }
       
-      // Draw ROI box on preview
-      if (previewCanvas) {
-        const previewCtx = previewCanvas.getContext('2d');
-        previewCtx.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
-        previewCtx.strokeStyle = 'red';
-        previewCtx.lineWidth = 2;
-        const previewRoiX = previewCanvas.width / 2 - 20;
-        const previewRoiY = previewCanvas.height / 2 - 20;
-        previewCtx.strokeRect(previewRoiX, previewRoiY, 40, 40);
+      // Draw ROI box on measurement preview
+      if (measureCanvas) {
+        const measureCtx = measureCanvas.getContext('2d');
+        measureCtx.clearRect(0, 0, measureCanvas.width, measureCanvas.height);
+        measureCtx.strokeStyle = 'red';
+        measureCtx.lineWidth = 2;
+        const measureRoiX = measureCanvas.width / 2 - 20;
+        const measureRoiY = measureCanvas.height / 2 - 20;
+        measureCtx.strokeRect(measureRoiX, measureRoiY, 40, 40);
       }
       
       // Continue processing frames
       frameProcessorId = requestAnimationFrame(processFrame);
     }
+    
+    // Stop measuring and clean up
+    function stopMeasuring() {
+      measuring = false;
+      
+      // Clear timers
+      if (countdownTimer) {
+        clearInterval(countdownTimer);
+        countdownTimer = null;
+      }
+      
+      if (measurementTimer) {
+        clearTimeout(measurementTimer);
+        measurementTimer = null;
+      }
+      
+      if (frameProcessorId) {
+        cancelAnimationFrame(frameProcessorId);
+        frameProcessorId = null;
+      }
+      
+      // Turn off flash
+      if (flashActive && stream) {
+        const track = stream.getVideoTracks()[0];
+        if (track) {
+          track.applyConstraints({ advanced: [{ torch: false }] });
+          flashActive = false;
+        }
+      }
+      
+      // Stop video stream
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+        stream = null;
+      }
+      
+      flashToggleBtn.classList.add('hidden');
+    }
+    
+    // Finalize all measurements and show results
+    function finalizeMeasurements() {
+      // Calculate final heart rate from valid readings
+      const validReadings = individualReadings.filter(r => 
+        typeof r === 'number' && r >= MIN_BPM && r <= MAX_BPM
+      );
+      
+      let finalHR;
+      if (validReadings.length > 0) {
+        const sortedReadings = [...validReadings].sort((a, b) => a - b);
+        finalHR = sortedReadings[Math.floor(sortedReadings.length / 2)]; // Median
+      } else {
+        finalHR = FAILED_MEASUREMENT_TEXT;
+      }
+      
+      heartRate = finalHR;
+      
+      // Calculate recommended tempo
+      if (typeof heartRate === 'number') {
+        recommendedTempo = Math.floor(heartRate * 0.7);
+        if (recommendedTempo < 50) recommendedTempo = 50; // Minimum practical tempo
+        
+        // Update UI
+        tempoValue.textContent = `${recommendedTempo} BPM`;
+        currentTempo.textContent = recommendedTempo;
+        startSessionBtn.disabled = false;
+        startSessionBtn.classList.remove('btn-disabled');
+      } else {
+        // Failed to get valid measurement
+        recommendedTempo = FAILED_MEASUREMENT_TEXT;
+        tempoValue.textContent = "N/A";
+        currentTempo.textContent = "N/A";
+        startSessionBtn.disabled = true;
+        startSessionBtn.classList.add('btn-disabled');
+      }
+      
+      // Update UI
+      heartRateValue.textContent = (typeof heartRate === 'number') ? 
+        `${heartRate} BPM` : "Measurement Failed";
+      updateResultReadings();
+      
+      measuringState.classList.add('hidden');
+      resultsState.classList.remove('hidden');
+      
+      stopMeasuring();
+    }
+    
+    // =================== SIGNAL PROCESSING ===================
     
     // Apply smoothing to signal
     function smoothSignal(data) {
@@ -1229,181 +1442,11 @@
       return (hr >= MIN_BPM && hr <= MAX_BPM) ? hr : null;
     }
     
-    // Start measurement process
+    // =================== UI MANAGEMENT ===================
+    
+    // Start the measurement process
     async function startMeasurement() {
       await startPositioning();
-    }
-    
-    // Start a single measurement cycle
-    function startSingleMeasurement() {
-      // Update UI
-      countdownElement.textContent = `${measurementNumber}/${TOTAL_MEASUREMENTS}`;
-      updateMeasurementIndicators();
-      
-      // Reset data for this measurement
-      redValuesBuffer = [];
-      
-      // Start video processing
-      if (frameProcessorId) cancelAnimationFrame(frameProcessorId);
-      frameProcessorId = requestAnimationFrame(processFrame);
-      
-      // Schedule measurement completion
-      measurementTimer = setTimeout(() => {
-        // Stop frame processing
-        if (frameProcessorId) {
-          cancelAnimationFrame(frameProcessorId);
-          frameProcessorId = null;
-        }
-        
-        // Calculate heart rate
-        const hr = calculateHeartRate();
-        const newReading = (hr !== null) ? hr : FAILED_MEASUREMENT_TEXT;
-        individualReadings.push(newReading);
-        
-        // Update UI
-        updateReadings();
-        updateMeasurementIndicators();
-        
-        // Proceed to next measurement or finalize
-        if (measurementNumber < TOTAL_MEASUREMENTS) {
-          measurementNumber++;
-          setTimeout(() => startSingleMeasurement(), 1000);
-        } else {
-          finalizeMeasurements();
-        }
-      }, MEASUREMENT_DURATION * 1000);
-    }
-    
-    // Finalize all measurements and show results
-    function finalizeMeasurements() {
-      // Calculate final heart rate from valid readings
-      const validReadings = individualReadings.filter(r => 
-        typeof r === 'number' && r >= MIN_BPM && r <= MAX_BPM
-      );
-      
-      let finalHR;
-      if (validReadings.length > 0) {
-        const sortedReadings = [...validReadings].sort((a, b) => a - b);
-        finalHR = sortedReadings[Math.floor(sortedReadings.length / 2)]; // Median
-      } else {
-        finalHR = FAILED_MEASUREMENT_TEXT;
-      }
-      
-      heartRate = finalHR;
-      
-      // Calculate recommended tempo
-      if (typeof heartRate === 'number') {
-        recommendedTempo = Math.floor(heartRate * 0.7);
-        if (recommendedTempo < 50) recommendedTempo = 50; // Minimum practical tempo
-        
-        // Update UI
-        tempoValue.textContent = `${recommendedTempo} BPM`;
-        currentTempo.textContent = recommendedTempo;
-        startSessionBtn.disabled = false;
-        startSessionBtn.classList.remove('btn-disabled');
-      } else {
-        // Failed to get valid measurement
-        recommendedTempo = FAILED_MEASUREMENT_TEXT;
-        tempoValue.textContent = "N/A";
-        currentTempo.textContent = "N/A";
-        startSessionBtn.disabled = true;
-        startSessionBtn.classList.add('btn-disabled');
-      }
-      
-      // Update UI
-      heartRateValue.textContent = (typeof heartRate === 'number') ? 
-        `${heartRate} BPM` : "Measurement Failed";
-      updateResultReadings();
-      
-      measuringState.classList.add('hidden');
-      resultsState.classList.remove('hidden');
-      
-      stopMeasuring();
-    }
-    
-    // Stop measuring and clean up
-    function stopMeasuring() {
-      measuring = false;
-      
-      // Clear timers
-      if (countdownTimer) {
-        clearInterval(countdownTimer);
-        countdownTimer = null;
-      }
-      
-      if (measurementTimer) {
-        clearTimeout(measurementTimer);
-        measurementTimer = null;
-      }
-      
-      if (frameProcessorId) {
-        cancelAnimationFrame(frameProcessorId);
-        frameProcessorId = null;
-      }
-      
-      // Turn off flash
-      if (flashActive && stream) {
-        const track = stream.getVideoTracks()[0];
-        if (track) {
-          track.applyConstraints({ advanced: [{ torch: false }] });
-          flashActive = false;
-        }
-      }
-      
-      // Stop video stream
-      if (stream) {
-        stream.getTracks().forEach(track => track.stop());
-        stream = null;
-      }
-      
-      flashToggleBtn.classList.add('hidden');
-    }
-    
-    // Visualization
-    function updateVisualization() {
-      visualization.innerHTML = '';
-      
-      const displayPoints = dataPoints.slice(-100);
-      if (displayPoints.length === 0) return;
-      
-      // Find min/max for scaling
-      const minVal = Math.min(...displayPoints);
-      const maxVal = Math.max(...displayPoints);
-      const range = (maxVal - minVal) === 0 ? 1 : (maxVal - minVal);
-      
-      // Adjust peak indices for visualization
-      const visiblePeaks = [];
-      for (const peak of detectedPeaks) {
-        const adjustedIndex = peak - (redValuesBuffer.length - displayPoints.length);
-        if (adjustedIndex >= 0 && adjustedIndex < displayPoints.length) {
-          visiblePeaks.push(adjustedIndex);
-        }
-      }
-      
-      // Create visualization bars
-      for (let i = 0; i < displayPoints.length; i++) {
-        const value = displayPoints[i];
-        const normalizedValue = ((value - minVal) / range) * 100;
-        const height = Math.max(1, Math.min(100, normalizedValue));
-        
-        const bar = document.createElement('div');
-        bar.className = 'visualization-bar';
-        if (visiblePeaks.includes(i)) {
-          bar.classList.add('peak');
-        }
-        
-        bar.style.height = `${height}%`;
-        bar.style.left = `${(i / displayPoints.length) * 100}%`;
-        bar.style.width = `${Math.max(1, 100 / displayPoints.length)}%`;
-        
-        visualization.appendChild(bar);
-      }
-    }
-    
-    // Clear visualization
-    function clearVisualization() {
-      visualization.innerHTML = '';
-      dataPoints = [];
     }
     
     // Update readings display
@@ -1479,6 +1522,55 @@
       }
     }
     
+    // Visualization
+    function updateVisualization() {
+      visualization.innerHTML = '';
+      
+      const displayPoints = dataPoints.slice(-100);
+      if (displayPoints.length === 0) return;
+      
+      // Find min/max for scaling
+      const minVal = Math.min(...displayPoints);
+      const maxVal = Math.max(...displayPoints);
+      const range = (maxVal - minVal) === 0 ? 1 : (maxVal - minVal);
+      
+      // Adjust peak indices for visualization
+      const visiblePeaks = [];
+      for (const peak of detectedPeaks) {
+        const adjustedIndex = peak - (redValuesBuffer.length - displayPoints.length);
+        if (adjustedIndex >= 0 && adjustedIndex < displayPoints.length) {
+          visiblePeaks.push(adjustedIndex);
+        }
+      }
+      
+      // Create visualization bars
+      for (let i = 0; i < displayPoints.length; i++) {
+        const value = displayPoints[i];
+        const normalizedValue = ((value - minVal) / range) * 100;
+        const height = Math.max(1, Math.min(100, normalizedValue));
+        
+        const bar = document.createElement('div');
+        bar.className = 'visualization-bar';
+        if (visiblePeaks.includes(i)) {
+          bar.classList.add('peak');
+        }
+        
+        bar.style.height = `${height}%`;
+        bar.style.left = `${(i / displayPoints.length) * 100}%`;
+        bar.style.width = `${Math.max(1, 100 / displayPoints.length)}%`;
+        
+        visualization.appendChild(bar);
+      }
+    }
+    
+    // Clear visualization
+    function clearVisualization() {
+      visualization.innerHTML = '';
+      dataPoints = [];
+    }
+    
+    // =================== MEDITATION ===================
+    
     // Start meditation session
     function startMeditation() {
       if (typeof heartRate !== 'number' || meditationActive) return;
@@ -1517,17 +1609,19 @@
       }
     }
     
-    // Event listeners
+    // =================== EVENT LISTENERS ===================
+    
     document.addEventListener('DOMContentLoaded', function() {
       checkCameras();
       
+      // Attach event listeners to buttons
       startMeasurementBtn.addEventListener('click', startMeasurement);
       cameraToggle.addEventListener('click', toggleCamera);
       flashToggleBtn.addEventListener('click', toggleFlash);
+      skipPositioningBtn.addEventListener('click', startMeasuring);
       remeasureBtn.addEventListener('click', startMeasurement);
       startSessionBtn.addEventListener('click', startMeditation);
       endSessionBtn.addEventListener('click', endMeditation);
-      skipPositioningBtn.addEventListener('click', startMeasuring);
     });
     
     // Clean up on page unload
