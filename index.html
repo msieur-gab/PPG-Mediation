@@ -120,6 +120,43 @@
       margin-top: 4px;
     }
     
+    /* Finger guidance elements */
+    .target-area {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 60px;
+      height: 60px;
+      border: 2px dashed #f87171;
+      border-radius: 8px;
+      z-index: 2;
+    }
+    
+    .finger-dot {
+      position: absolute;
+      width: 12px;
+      height: 12px;
+      background-color: white;
+      border: 2px solid #ef4444;
+      border-radius: 50%;
+      z-index: 3;
+      transform: translate(-50%, -50%);
+      transition: all 0.1s ease-out;
+    }
+    
+    .preview-guidance {
+      text-align: center;
+      font-size: 0.875rem;
+      color: #ef4444;
+      font-weight: 500;
+      margin-top: 8px;
+    }
+    
+    .good-position {
+      color: #10b981;
+    }
+    
     /* Countdown */
     .countdown {
       width: 64px;
@@ -210,6 +247,35 @@
       color: #6b7280;
     }
     
+    /* Signal quality indicator */
+    .signal-quality {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-top: 8px;
+      font-size: 0.75rem;
+    }
+    
+    .quality-indicator {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      margin-right: 4px;
+    }
+    
+    .quality-poor {
+      background-color: #f59e0b;
+    }
+    
+    .quality-fair {
+      background-color: #3b82f6;
+    }
+    
+    .quality-good {
+      background-color: #10b981;
+    }
+    
     /* Signal visualization */
     .visualization {
       height: 64px;
@@ -226,6 +292,12 @@
       width: 4px;
       background-color: #ef4444;
       opacity: 0.7;
+    }
+    
+    /* Peak indicator in visualization */
+    .visualization-bar.peak {
+      background-color: #10b981;
+      opacity: 1;
     }
     
     /* Results */
@@ -455,7 +527,7 @@
         <div class="preview-container" id="previewContainer">
           <video id="previewVideo" class="camera-preview" playsinline muted autoplay></video>
           <canvas id="previewCanvas" class="preview-overlay" width="128" height="128"></canvas>
-          <div class="preview-help">Center your fingertip in the red box</div>
+          <!-- Finger guidance elements will be added by JavaScript -->
         </div>
         
         <div id="countdown" class="countdown pulse">5</div>
@@ -468,6 +540,11 @@
         </div>
         
         <div id="readings" class="readings"></div>
+        
+        <div id="signalQuality" class="signal-quality hidden">
+          <span class="quality-indicator quality-fair"></span>
+          <span>Signal Quality: <span id="qualityValue">Calibrating...</span></span>
+        </div>
         
         <div id="visualization" class="visualization"></div>
       </div>
@@ -544,6 +621,7 @@
     const FPS = 30;
     const MEASUREMENT_DURATION = 8; // seconds
     const BUFFER_SIZE = FPS * MEASUREMENT_DURATION;
+    const CALIBRATION_DURATION = 2; // seconds for auto-calibration
     const TOTAL_MEASUREMENTS = 3;
     const FAILED_MEASUREMENT_TEXT = "Failed"; // Constant for failed measurement
     
@@ -560,6 +638,10 @@
     let individualReadings = []; // Can now store numbers or FAILED_MEASUREMENT_TEXT
     let cameraFacing = 'environment'; // 'environment' for back, 'user' for front
     let availableCameras = [];
+    let signalQuality = 'Unknown'; // Signal quality assessment
+    let fingerDot = null; // Element for finger positioning guidance
+    let targetArea = null; // Element for target area
+    let previewGuidance = null; // Element for guidance text
     
     // References to DOM elements
     const initialState = document.getElementById('initialState');
@@ -579,6 +661,8 @@
     const measurementIndicators = document.getElementById('measurementIndicators');
     const readings = document.getElementById('readings');
     const visualization = document.getElementById('visualization');
+    const signalQualityElement = document.getElementById('signalQuality');
+    const qualityValueElement = document.getElementById('qualityValue');
     
     const heartRateValue = document.getElementById('heartRateValue');
     const resultReadings = document.getElementById('resultReadings');
@@ -777,7 +861,37 @@
       cameraError.classList.remove('hidden');
     }
     
-    // Process video frame to extract red channel average
+    // Create and add finger guidance elements
+    function setupFingerGuidance() {
+      const previewContainer = document.getElementById('previewContainer');
+      
+      // Create target area element if it doesn't exist
+      if (!targetArea) {
+        targetArea = document.createElement('div');
+        targetArea.className = 'target-area';
+        previewContainer.appendChild(targetArea);
+      }
+      
+      // Create finger dot element if it doesn't exist
+      if (!fingerDot) {
+        fingerDot = document.createElement('div');
+        fingerDot.className = 'finger-dot';
+        fingerDot.style.left = '50%';
+        fingerDot.style.top = '50%';
+        previewContainer.appendChild(fingerDot);
+      }
+      
+      // Create guidance text if it doesn't exist
+      if (!previewGuidance) {
+        previewGuidance = document.createElement('p');
+        previewGuidance.className = 'preview-guidance';
+        previewGuidance.textContent = "Position your finger on the target";
+        // Insert after preview container
+        previewContainer.parentNode.insertBefore(previewGuidance, previewContainer.nextSibling);
+      }
+    }
+    
+    // Process video frame to extract red channel average and track finger position
     function processFrame() {
       if (!processingVideo || !processingCanvas || !measuring || !stream || processingVideo.paused || processingVideo.ended) return; 
       
@@ -800,6 +914,64 @@
           0, 0, canvas.width, canvas.height    // Destination rectangle
         );
         
+        // Track the brightest area (likely the finger)
+        const fullPixelData = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+        let brightestX = 0;
+        let brightestY = 0;
+        let maxBrightness = 0;
+        
+        // Scan every 5 pixels to improve performance
+        for (let y = 0; y < canvas.height; y += 5) {
+          for (let x = 0; x < canvas.width; x += 5) {
+            const i = (y * canvas.width + x) * 4;
+            const r = fullPixelData[i];
+            const g = fullPixelData[i + 1];
+            const b = fullPixelData[i + 2];
+            
+            // Calculate brightness (red channel is most important for PPG)
+            const brightness = r * 0.7 + g * 0.2 + b * 0.1;
+            
+            if (brightness > maxBrightness) {
+              maxBrightness = brightness;
+              brightestX = x;
+              brightestY = y;
+            }
+          }
+        }
+        
+        // Update the finger dot position
+        if (fingerDot && maxBrightness > 100) { // Only track if bright enough
+          const previewWidth = previewCanvas.width;
+          const previewHeight = previewCanvas.height;
+          
+          // Scale coordinates from processing canvas to preview canvas
+          const scaledX = (brightestX / canvas.width) * previewWidth;
+          const scaledY = (brightestY / canvas.height) * previewHeight;
+          
+          fingerDot.style.left = `${scaledX}px`;
+          fingerDot.style.top = `${scaledY}px`;
+          
+          // Check if finger is in the target area
+          const targetCenterX = previewCanvas.width / 2;
+          const targetCenterY = previewCanvas.height / 2;
+          const distance = Math.sqrt(
+            Math.pow(scaledX - targetCenterX, 2) + 
+            Math.pow(scaledY - targetCenterY, 2)
+          );
+          
+          // Update guidance message
+          if (previewGuidance) {
+            if (distance < 25) { // Good position (within 25px of center)
+              previewGuidance.textContent = "Perfect! Keep steady";
+              previewGuidance.classList.add('good-position');
+            } else {
+              previewGuidance.textContent = "Move your finger to the target";
+              previewGuidance.classList.remove('good-position');
+            }
+          }
+        }
+        
+        // Extract red channel data from ROI
         const roiX = canvas.width / 2 - 20;
         const roiY = canvas.height / 2 - 20;
         const roiWidth = 40;
@@ -828,9 +1000,11 @@
       if (previewCanvas) {
         const previewCtx = previewCanvas.getContext('2d');
         previewCtx.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
-        previewCtx.strokeStyle = 'red';
+        
+        // No need to draw ROI box since we have the target area element now
+        // But we'll keep this for compatibility
+        previewCtx.strokeStyle = 'rgba(255, 99, 71, 0.3)';
         previewCtx.lineWidth = 2;
-        // Ensure ROI on preview matches processing ROI if preview is different size
         const previewRoiX = previewCanvas.width / 2 - 20; 
         const previewRoiY = previewCanvas.height / 2 - 20;
         previewCtx.strokeRect(previewRoiX, previewRoiY, 40, 40);
@@ -839,52 +1013,215 @@
       frameProcessorId = requestAnimationFrame(processFrame);
     }
     
-    // Calculate heart rate from red values
+    // Calculate heart rate from red values with improved signal processing
     function calculateHeartRate() {
       if (redValuesBuffer.length < FPS * 3) { 
         console.warn("Not enough data to calculate heart rate.");
         return null; 
       }
       
+      // Step 1: Calculate mean for normalization
       const mean = redValuesBuffer.reduce((sum, val) => sum + val, 0) / redValuesBuffer.length;
       const normalizedValues = redValuesBuffer.map(val => val - mean);
       
+      // Step 2: Apply moving average filter to reduce noise
+      const windowSize = 3; // Small window to preserve peaks but reduce noise
+      const filteredValues = [];
+      for (let i = 0; i < normalizedValues.length; i++) {
+        let sum = 0;
+        let count = 0;
+        for (let j = Math.max(0, i - windowSize); j <= Math.min(normalizedValues.length - 1, i + windowSize); j++) {
+          sum += normalizedValues[j];
+          count++;
+        }
+        filteredValues.push(sum / count);
+      }
+      
+      // Step 3: Calculate signal quality metrics
+      const variance = filteredValues.reduce((sum, val) => sum + val * val, 0) / filteredValues.length;
+      const prevSignalQuality = signalQuality;
+      
+      if (variance > 30) {
+        signalQuality = 'Good';
+      } else if (variance > 10) {
+        signalQuality = 'Fair';
+      } else {
+        signalQuality = 'Poor';
+      }
+      
+      // Update UI if signal quality changed
+      if (signalQuality !== prevSignalQuality) {
+        updateSignalQualityUI();
+      }
+      
+      console.log(`Signal quality: ${signalQuality} (variance: ${variance.toFixed(2)})`);
+      
+      // Step 4: Adaptive peak detection
       const peaks = [];
-      if (normalizedValues.length === 0) return null; // Should not happen if buffer has data
+      if (filteredValues.length === 0) return null;
       
-      const maxNormalizedValue = Math.max(...normalizedValues);
-      // Ensure peakThreshold is not negative or zero if all normalizedValues are negative/zero
-      const peakThreshold = maxNormalizedValue > 0 ? maxNormalizedValue * 0.3 : 0.1; 
+      const maxValue = Math.max(...filteredValues);
+      const minValue = Math.min(...filteredValues);
+      const range = maxValue - minValue;
       
-      for (let i = 1; i < normalizedValues.length - 1; i++) {
-        if (normalizedValues[i] > normalizedValues[i-1] && 
-            normalizedValues[i] > normalizedValues[i+1] &&
-            normalizedValues[i] > peakThreshold) { 
-          peaks.push(i); 
+      // Adaptive threshold based on signal quality and range
+      let peakThresholdPercent = 0.3; // Default 30%
+      if (signalQuality === 'Poor') peakThresholdPercent = 0.2; // Lower threshold for poor signal
+      if (signalQuality === 'Good') peakThresholdPercent = 0.35; // Higher threshold for good signal
+      
+      const peakThreshold = range * peakThresholdPercent;
+      
+      // Minimum distance between peaks in frames (to avoid double counting)
+      const minPeakDistance = Math.floor(FPS * 0.5); // ~0.5 seconds minimum between peaks
+      let lastPeakIndex = -minPeakDistance;
+      
+      for (let i = 2; i < filteredValues.length - 2; i++) {
+        // Check if this point is a local maximum in a 5-point window
+        if (filteredValues[i] > filteredValues[i-1] && 
+            filteredValues[i] > filteredValues[i-2] &&
+            filteredValues[i] > filteredValues[i+1] && 
+            filteredValues[i] > filteredValues[i+2] &&
+            filteredValues[i] > peakThreshold && 
+            i - lastPeakIndex >= minPeakDistance) {
+          
+          peaks.push(i);
+          lastPeakIndex = i;
         }
       }
       
       if (peaks.length < 2) {
-        console.warn("Not enough peaks detected to calculate heart rate.");
+        console.warn(`Not enough peaks detected (found ${peaks.length}) for signal quality: ${signalQuality}`);
         return null; 
       }
       
-      let totalInterval = 0;
+      // Step 5: Calculate intervals between peaks
+      const intervals = [];
       for (let i = 1; i < peaks.length; i++) {
-        totalInterval += peaks[i] - peaks[i-1]; 
+        intervals.push(peaks[i] - peaks[i-1]);
       }
-      const avgIntervalFrames = totalInterval / (peaks.length - 1); 
       
-      if (avgIntervalFrames === 0) return null; // Avoid division by zero
-
-      const heartRate = Math.round((FPS * 60) / avgIntervalFrames);
+      // Remove outlier intervals (those that deviate significantly from median)
+      const sortedIntervals = [...intervals].sort((a, b) => a - b);
+      const medianInterval = sortedIntervals[Math.floor(sortedIntervals.length / 2)];
       
+      const validIntervals = intervals.filter(interval => 
+        interval >= medianInterval * 0.7 && interval <= medianInterval * 1.3
+      );
+      
+      if (validIntervals.length < intervals.length * 0.5) {
+        console.warn("Too many irregular intervals detected, possible unreliable signal");
+        if (signalQuality === 'Poor') return null;
+      }
+      
+      const avgInterval = validIntervals.length > 0 
+        ? validIntervals.reduce((sum, val) => sum + val, 0) / validIntervals.length 
+        : medianInterval;
+      
+      if (avgInterval === 0) return null; // Avoid division by zero
+      
+      // Step 6: Convert to heart rate
+      const heartRate = Math.round((FPS * 60) / avgInterval);
+      
+      // Validate result is physiologically plausible
       if (heartRate >= 40 && heartRate <= 220) {
         return heartRate;
       } else {
         console.warn(`Calculated heart rate (${heartRate} BPM) is outside typical range.`);
         return null; 
       }
+    }
+    
+    // Update signal quality UI indicator
+    function updateSignalQualityUI() {
+      if (!signalQualityElement || !qualityValueElement) return;
+      
+      // Show signal quality element
+      signalQualityElement.classList.remove('hidden');
+      
+      // Update text
+      qualityValueElement.textContent = signalQuality;
+      
+      // Update indicator color
+      const qualityIndicator = signalQualityElement.querySelector('.quality-indicator');
+      if (qualityIndicator) {
+        qualityIndicator.className = 'quality-indicator';
+        if (signalQuality === 'Good') {
+          qualityIndicator.classList.add('quality-good');
+        } else if (signalQuality === 'Fair') {
+          qualityIndicator.classList.add('quality-fair');
+        } else {
+          qualityIndicator.classList.add('quality-poor');
+        }
+      }
+    }
+    
+    // Enhanced visualization with peak detection
+    function updateVisualization() {
+      visualization.innerHTML = ''; 
+      
+      const displayPoints = dataPoints.slice(-100); 
+      if (displayPoints.length === 0) return;
+
+      const minVal = Math.min(...displayPoints); 
+      const maxVal = Math.max(...displayPoints); 
+      const range = (maxVal - minVal) === 0 ? 1 : (maxVal - minVal); 
+
+      // Filter points for visualization
+      const mean = displayPoints.reduce((sum, val) => sum + val, 0) / displayPoints.length;
+      const normalizedPoints = displayPoints.map(val => val - mean);
+      
+      // Apply simple moving average filter for visualization
+      const windowSize = 3;
+      const filteredPoints = [];
+      for (let i = 0; i < normalizedPoints.length; i++) {
+        let sum = 0;
+        let count = 0;
+        for (let j = Math.max(0, i - windowSize); j <= Math.min(normalizedPoints.length - 1, i + windowSize); j++) {
+          sum += normalizedPoints[j];
+          count++;
+        }
+        filteredPoints.push(sum / count);
+      }
+      
+      // Find peaks for visualization
+      const visualPeaks = [];
+      const maxFiltered = Math.max(...filteredPoints);
+      const peakThreshold = maxFiltered * 0.3;
+      
+      for (let i = 2; i < filteredPoints.length - 2; i++) {
+        if (filteredPoints[i] > filteredPoints[i-1] && 
+            filteredPoints[i] > filteredPoints[i-2] &&
+            filteredPoints[i] > filteredPoints[i+1] && 
+            filteredPoints[i] > filteredPoints[i+2] &&
+            filteredPoints[i] > peakThreshold) {
+          visualPeaks.push(i);
+        }
+      }
+
+      for (let i = 0; i < displayPoints.length; i++) {
+        const value = displayPoints[i];
+        const normalizedValue = ((value - minVal) / range) * 100; 
+        const height = Math.max(1, Math.min(100, normalizedValue)); 
+        
+        const bar = document.createElement('div');
+        bar.className = 'visualization-bar';
+        bar.style.height = `${height}%`;
+        bar.style.left = `${(i / displayPoints.length) * 100}%`; 
+        bar.style.width = `${Math.max(1, 100 / displayPoints.length)}%`;
+        
+        // Highlight peaks in the visualization
+        if (visualPeaks.includes(i)) {
+          bar.classList.add('peak');
+        }
+
+        visualization.appendChild(bar);
+      }
+    }
+    
+    // Clear visualization
+    function clearVisualization() {
+      visualization.innerHTML = '';
+      dataPoints = []; 
     }
     
     // Start measurement process
@@ -895,6 +1232,7 @@
       dataPoints = []; 
       measurementNumber = 0; 
       individualReadings = [];
+      signalQuality = 'Unknown'; // Reset signal quality
       
       initialState.classList.add('hidden');
       resultsState.classList.add('hidden');
@@ -906,6 +1244,10 @@
       clearVisualization();
       updateMeasurementIndicators(); 
       clearReadings();
+      signalQualityElement.classList.add('hidden'); // Hide signal quality initially
+      
+      // Setup finger guidance
+      setupFingerGuidance();
       
       try {
         const cameraStarted = await startCameraWithFacing(cameraFacing);
@@ -939,7 +1281,7 @@
       }
     }
     
-    // Start a single measurement cycle
+    // Start a single measurement with auto-calibration
     function startSingleMeasurement() {
       countdownElement.textContent = `${measurementNumber}/${TOTAL_MEASUREMENTS}`;
       updateMeasurementIndicators(); 
@@ -949,60 +1291,126 @@
       if (frameProcessorId) cancelAnimationFrame(frameProcessorId); 
       frameProcessorId = requestAnimationFrame(processFrame);
       
+      // Auto-calibration period
       setTimeout(() => {
-        if (frameProcessorId) {
-          cancelAnimationFrame(frameProcessorId);
-          frameProcessorId = null;
-        }
-        
-        const hr = calculateHeartRate();
-        const newReading = (hr !== null) ? hr : FAILED_MEASUREMENT_TEXT;
-        individualReadings.push(newReading);
-        
-        updateReadings(); 
-        updateMeasurementIndicators(); 
-        
-        if (measurementNumber < TOTAL_MEASUREMENTS) {
-          measurementNumber++; 
+        // After calibration time, check if we have enough data
+        if (redValuesBuffer.length > FPS * CALIBRATION_DURATION) {
+          // Calculate initial signal quality to adjust measurement parameters
+          const mean = redValuesBuffer.reduce((sum, val) => sum + val, 0) / redValuesBuffer.length;
+          const normalizedValues = redValuesBuffer.map(val => val - mean);
+          const variance = normalizedValues.reduce((sum, val) => sum + val * val, 0) / normalizedValues.length;
+          
+          // Set initial signal quality
+          if (variance > 30) {
+            signalQuality = 'Good';
+          } else if (variance > 10) {
+            signalQuality = 'Fair';
+          } else {
+            signalQuality = 'Poor';
+          }
+          
+          updateSignalQualityUI();
+          console.log(`Calibration complete. Signal quality: ${signalQuality} (variance: ${variance.toFixed(2)})`);
+          
+          // Optionally adjust measurement duration based on initial signal quality
+          let adjustedDuration = MEASUREMENT_DURATION;
+          if (signalQuality === 'Poor') { 
+            adjustedDuration = Math.min(MEASUREMENT_DURATION + 2, 12); // Add up to 2 seconds, max 12 seconds
+            console.log(`Signal quality is poor. Extended measurement duration to ${adjustedDuration}s`);
+          }
+          
+          // Continue with the actual measurement
           setTimeout(() => {
-            startSingleMeasurement();
-          }, 1000); 
+            if (frameProcessorId) {
+              cancelAnimationFrame(frameProcessorId);
+              frameProcessorId = null;
+            }
+            
+            const hr = calculateHeartRate();
+            const newReading = (hr !== null) ? hr : FAILED_MEASUREMENT_TEXT;
+            individualReadings.push(newReading);
+            
+            updateReadings(); 
+            updateMeasurementIndicators(); 
+            
+            if (measurementNumber < TOTAL_MEASUREMENTS) {
+              measurementNumber++; 
+              setTimeout(() => {
+                startSingleMeasurement();
+              }, 1000); 
+            } else {
+              // Finalize measurements
+              finalizeMeasurements();
+            }
+          }, (adjustedDuration - CALIBRATION_DURATION) * 1000);
+          
         } else {
-          const validReadings = individualReadings.filter(r => typeof r === 'number' && r >= 40 && r <= 220);
+          // Fallback if calibration failed
+          console.warn("Not enough data for calibration, proceeding with default parameters");
           
-          let finalHR;
-          if (validReadings.length > 0) {
-            const sortedReadings = [...validReadings].sort((a, b) => a - b);
-            finalHR = sortedReadings[Math.floor(sortedReadings.length / 2)];
-          } else {
-            finalHR = FAILED_MEASUREMENT_TEXT; 
-          }
-          
-          heartRate = finalHR; 
-          
-          if (typeof heartRate === 'number') {
-            recommendedTempo = Math.floor(heartRate * 0.7);
-            tempoValue.textContent = `${recommendedTempo} BPM`;
-            currentTempo.textContent = recommendedTempo;
-            startSessionBtn.disabled = false; 
-            startSessionBtn.classList.remove('btn-disabled'); 
-          } else {
-            recommendedTempo = FAILED_MEASUREMENT_TEXT; 
-            tempoValue.textContent = "N/A";
-            currentTempo.textContent = "N/A";
-            startSessionBtn.disabled = true; 
-            startSessionBtn.classList.add('btn-disabled'); 
-          }
-          
-          heartRateValue.textContent = (typeof heartRate === 'number') ? `${heartRate} BPM` : "Measurement Failed";
-          updateResultReadings(); 
-          
-          measuringState.classList.add('hidden');
-          resultsState.classList.remove('hidden');
-          
-          stopMeasuring(); 
+          // Continue with standard measurement duration
+          setTimeout(() => {
+            if (frameProcessorId) {
+              cancelAnimationFrame(frameProcessorId);
+              frameProcessorId = null;
+            }
+            
+            const hr = calculateHeartRate();
+            const newReading = (hr !== null) ? hr : FAILED_MEASUREMENT_TEXT;
+            individualReadings.push(newReading);
+            
+            updateReadings(); 
+            updateMeasurementIndicators(); 
+            
+            if (measurementNumber < TOTAL_MEASUREMENTS) {
+              measurementNumber++; 
+              setTimeout(() => {
+                startSingleMeasurement();
+              }, 1000); 
+            } else {
+              // Finalize measurements
+              finalizeMeasurements();
+            }
+          }, MEASUREMENT_DURATION * 1000);
         }
-      }, MEASUREMENT_DURATION * 1000);
+      }, CALIBRATION_DURATION * 1000);
+    }
+    
+    // Finalize measurements and show results
+    function finalizeMeasurements() {
+      const validReadings = individualReadings.filter(r => typeof r === 'number' && r >= 40 && r <= 220);
+      
+      let finalHR;
+      if (validReadings.length > 0) {
+        const sortedReadings = [...validReadings].sort((a, b) => a - b);
+        finalHR = sortedReadings[Math.floor(sortedReadings.length / 2)];
+      } else {
+        finalHR = FAILED_MEASUREMENT_TEXT; 
+      }
+      
+      heartRate = finalHR; 
+      
+      if (typeof heartRate === 'number') {
+        recommendedTempo = Math.floor(heartRate * 0.7);
+        tempoValue.textContent = `${recommendedTempo} BPM`;
+        currentTempo.textContent = recommendedTempo;
+        startSessionBtn.disabled = false; 
+        startSessionBtn.classList.remove('btn-disabled'); 
+      } else {
+        recommendedTempo = FAILED_MEASUREMENT_TEXT; 
+        tempoValue.textContent = "N/A";
+        currentTempo.textContent = "N/A";
+        startSessionBtn.disabled = true; 
+        startSessionBtn.classList.add('btn-disabled'); 
+      }
+      
+      heartRateValue.textContent = (typeof heartRate === 'number') ? `${heartRate} BPM` : "Measurement Failed";
+      updateResultReadings(); 
+      
+      measuringState.classList.add('hidden');
+      resultsState.classList.remove('hidden');
+      
+      stopMeasuring(); 
     }
     
     // Stop measuring and clean up
@@ -1018,210 +1426,17 @@
         stream.getTracks().forEach(track => track.stop());
         stream = null; 
       }
-    }
-    
-    // Simulate measurement 
-    function simulateMeasurement() {
-      measuring = true;
-      countdown = 5;
-      redValuesBuffer = [];
-      measurementNumber = 0; 
-      individualReadings = [];
       
-      initialState.classList.add('hidden');
-      resultsState.classList.add('hidden');
-      measuringState.classList.remove('hidden');
-      cameraError.classList.add('hidden');
-      
-      countdownElement.textContent = countdown;
-      countdownElement.classList.add('pulse');
-      clearVisualization();
-      updateMeasurementIndicators();
-      clearReadings();
-      
-      let simCountdownTimer = setInterval(() => {
-        countdown--;
-        countdownElement.textContent = countdown;
-        
-        if (countdown <= 0) {
-          clearInterval(simCountdownTimer);
-          simCountdownTimer = null;
-          countdownElement.classList.remove('pulse');
-          measurementNumber = 1;
-          simulateSingleMeasurement(); 
-        }
-      }, 1000);
-    }
-
-    function simulateSingleMeasurement() {
-        countdownElement.textContent = `${measurementNumber}/${TOTAL_MEASUREMENTS}`;
-        updateMeasurementIndicators();
-        simulateDataPoints(); 
-
-        setTimeout(() => {
-            const success = Math.random() > 0.2; 
-            const simulatedReading = success ? (Math.floor(Math.random() * 25) + 65) : FAILED_MEASUREMENT_TEXT;
-            individualReadings.push(simulatedReading);
-
-            updateReadings();
-            updateMeasurementIndicators(); 
-
-            if (measurementNumber < TOTAL_MEASUREMENTS) {
-                measurementNumber++;
-                setTimeout(simulateSingleMeasurement, 1000); 
-            } else {
-                const validReadings = individualReadings.filter(r => typeof r === 'number');
-                let finalHR;
-                if (validReadings.length > 0) {
-                    const sortedReadings = [...validReadings].sort((a, b) => a - b);
-                    finalHR = sortedReadings[Math.floor(sortedReadings.length / 2)]; 
-                } else {
-                    finalHR = FAILED_MEASUREMENT_TEXT;
-                }
-                heartRate = finalHR;
-
-                if (typeof heartRate === 'number') {
-                    recommendedTempo = Math.floor(heartRate * 0.7);
-                    tempoValue.textContent = `${recommendedTempo} BPM`;
-                    currentTempo.textContent = recommendedTempo;
-                    startSessionBtn.disabled = false;
-                    startSessionBtn.classList.remove('btn-disabled');
-                } else {
-                    recommendedTempo = "N/A";
-                    tempoValue.textContent = "N/A";
-                    currentTempo.textContent = "N/A";
-                    startSessionBtn.disabled = true;
-                    startSessionBtn.classList.add('btn-disabled');
-                }
-
-                heartRateValue.textContent = (typeof heartRate === 'number') ? `${heartRate} BPM` : "Measurement Failed";
-                updateResultReadings();
-
-                measuringState.classList.add('hidden');
-                resultsState.classList.remove('hidden');
-                // No real stream to stop in simulation, but good practice if stopMeasuring had other cleanup
-                // stopMeasuring(); 
-            }
-        }, MEASUREMENT_DURATION * 500); 
-    }
-    
-    // Simulate PPG data points for visualization
-    function simulateDataPoints() {
-      redValuesBuffer = []; 
-      const baseValue = 150;
-      const amplitude = 30;
-      const frequency = 1.2; 
-      const durationSeconds = 3; 
-      const numPoints = FPS * durationSeconds;
-
-      for (let i = 0; i < numPoints; i++) {
-        const time = i / FPS; 
-        const pulse = Math.sin(time * Math.PI * 2 * frequency) * amplitude;
-        const noise = Math.random() * 10 - 5; 
-        redValuesBuffer.push(baseValue + pulse + noise);
+      // Reset the guidance elements
+      if (fingerDot) {
+        fingerDot.style.left = '50%';
+        fingerDot.style.top = '50%';
       }
       
-      dataPoints = [...redValuesBuffer]; 
-      updateVisualization(); 
-      
-      let animationFrameCount = 0;
-      function animateSimulatedData() {
-        if (!measuring || redValuesBuffer.length === 0) {
-            if (frameProcessorId === simAnimationId) frameProcessorId = null; // Clean up if this was the animation
-            return; 
-        }
-
-        redValuesBuffer.shift();
-        const time = (numPoints + animationFrameCount) / FPS; 
-        const pulse = Math.sin(time * Math.PI * 2 * frequency) * amplitude;
-        const noise = Math.random() * 10 - 5;
-        redValuesBuffer.push(baseValue + pulse + noise);
-        
-        dataPoints = [...redValuesBuffer];
-        updateVisualization();
-        animationFrameCount++;
-        
-        if (measuring) { 
-          const simAnimationId = requestAnimationFrame(animateSimulatedData); 
-          if (!frameProcessorId) frameProcessorId = simAnimationId; // Store to allow cancellation
-        } else {
-            if (frameProcessorId === simAnimationId) frameProcessorId = null;
-        }
+      if (previewGuidance) {
+        previewGuidance.textContent = "Position your finger on the target";
+        previewGuidance.classList.remove('good-position');
       }
-      if (measuring) { 
-        const simAnimationId = requestAnimationFrame(animateSimulatedData);
-        frameProcessorId = simAnimationId; // Allow cancellation via frameProcessorId
-      }
-    }
-    
-    // Start meditation session
-    function startMeditation() {
-      if (typeof heartRate !== 'number' || meditationActive) return; 
-
-      meditationActive = true;
-      progress = 0;
-      
-      startSessionBtn.classList.add('hidden');
-      endSessionBtn.classList.remove('hidden');
-      meditationSection.classList.remove('hidden');
-      progressFill.style.width = '0%';
-      
-      const totalMeditationDurationMs = 10 * 60 * 1000; 
-      const progressUpdateIntervalMs = totalMeditationDurationMs / 100; 
-
-      animationId = setInterval(() => {
-        progress += 1;
-        progressFill.style.width = `${progress}%`;
-        
-        if (progress >= 100) {
-          endMeditation();
-        }
-      }, progressUpdateIntervalMs); 
-    }
-    
-    // End meditation session
-    function endMeditation() {
-      meditationActive = false;
-      
-      startSessionBtn.classList.remove('hidden');
-      endSessionBtn.classList.add('hidden');
-      
-      if (animationId) {
-        clearInterval(animationId);
-        animationId = null;
-      }
-    }
-    
-    // Update visualization display
-    function updateVisualization() {
-      visualization.innerHTML = ''; 
-      
-      const displayPoints = dataPoints.slice(-100); 
-      if (displayPoints.length === 0) return; // Nothing to display
-
-      const minVal = Math.min(...displayPoints); 
-      const maxVal = Math.max(...displayPoints); 
-      const range = (maxVal - minVal) === 0 ? 1 : (maxVal - minVal); 
-
-      for (let i = 0; i < displayPoints.length; i++) {
-        const value = displayPoints[i];
-        const normalizedValue = ((value - minVal) / range) * 100; 
-        const height = Math.max(1, Math.min(100, normalizedValue)); 
-        
-        const bar = document.createElement('div');
-        bar.className = 'visualization-bar';
-        bar.style.height = `${height}%`;
-        bar.style.left = `${(i / displayPoints.length) * 100}%`; 
-        bar.style.width = `${Math.max(1, 100 / displayPoints.length)}%`; // Ensure min width of 1px
-
-        visualization.appendChild(bar);
-      }
-    }
-    
-    // Clear visualization
-    function clearVisualization() {
-      visualization.innerHTML = '';
-      dataPoints = []; 
     }
     
     // Update readings display during measurement
@@ -1299,7 +1514,87 @@
         } else if (i === measurementNumber -1 && measuring) { // Current measurement in progress
             indicators[i].classList.add('active');
         }
-        // Indicators for future measurements (i >= measurementNumber or i >= individualReadings.length if not measuring) remain default gray
+        // Indicators for future measurements remain default gray
+      }
+    }
+    
+    // Simulate data points for testing
+    function simulateDataPoints() {
+      redValuesBuffer = []; 
+      const baseValue = 150;
+      const amplitude = 30;
+      const frequency = 1.2; 
+      const durationSeconds = 3; 
+      const numPoints = FPS * durationSeconds;
+
+      for (let i = 0; i < numPoints; i++) {
+        const time = i / FPS; 
+        const pulse = Math.sin(time * Math.PI * 2 * frequency) * amplitude;
+        const noise = Math.random() * 10 - 5; 
+        redValuesBuffer.push(baseValue + pulse + noise);
+      }
+      
+      dataPoints = [...redValuesBuffer]; 
+      updateVisualization(); 
+      
+      let animationFrameCount = 0;
+      function animateSimulatedData() {
+        if (!measuring || redValuesBuffer.length === 0) return; 
+
+        redValuesBuffer.shift();
+        const time = (numPoints + animationFrameCount) / FPS; 
+        const pulse = Math.sin(time * Math.PI * 2 * frequency) * amplitude;
+        const noise = Math.random() * 10 - 5;
+        redValuesBuffer.push(baseValue + pulse + noise);
+        
+        dataPoints = [...redValuesBuffer];
+        updateVisualization();
+        animationFrameCount++;
+        
+        if (measuring) { 
+          frameProcessorId = requestAnimationFrame(animateSimulatedData);
+        }
+      }
+      if (measuring) { 
+        frameProcessorId = requestAnimationFrame(animateSimulatedData);
+      }
+    }
+    
+    // Start meditation session
+    function startMeditation() {
+      if (typeof heartRate !== 'number' || meditationActive) return; 
+
+      meditationActive = true;
+      progress = 0;
+      
+      startSessionBtn.classList.add('hidden');
+      endSessionBtn.classList.remove('hidden');
+      meditationSection.classList.remove('hidden');
+      progressFill.style.width = '0%';
+      
+      const totalMeditationDurationMs = 10 * 60 * 1000; 
+      const progressUpdateIntervalMs = totalMeditationDurationMs / 100; 
+
+      animationId = setInterval(() => {
+        progress += 1;
+        progressFill.style.width = `${progress}%`;
+        
+        if (progress >= 100) {
+          endMeditation();
+        }
+      }, progressUpdateIntervalMs); 
+    }
+    
+    // End meditation session
+    function endMeditation() {
+      meditationActive = false;
+      
+      startSessionBtn.classList.remove('hidden');
+      endSessionBtn.classList.add('hidden');
+      
+      if (animationId) {
+        clearInterval(animationId);
+        animationId = null;
       }
     }
     
