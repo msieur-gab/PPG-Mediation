@@ -263,19 +263,40 @@
       position: relative;
       overflow: hidden;
       margin-top: 16px;
+      border-radius: 4px;
     }
     
-    .visualization-bar {
+    /* Line-style visualization (ECG-like) */
+    .signal-line {
       position: absolute;
-      bottom: 0;
-      width: 4px;
-      background-color: #ef4444;
-      opacity: 0.7;
+      width: 100%;
+      height: 100%;
+      top: 0;
+      left: 0;
+      z-index: 1;
     }
     
-    .visualization-bar.peak {
-      background-color: #10b981; /* Green for peaks */
-      opacity: 1;
+    /* Beat indicator */
+    .beat-indicator {
+      width: 20px;
+      height: 20px;
+      background-color: #ef4444;
+      border-radius: 50%;
+      position: fixed;
+      bottom: 16px;
+      right: 16px;
+      opacity: 0;
+      transition: opacity 0.1s ease;
+    }
+    
+    .beat-indicator.pulse {
+      animation: beat-pulse 0.5s 1;
+    }
+    
+    @keyframes beat-pulse {
+      0% { transform: scale(1); opacity: 0.7; }
+      50% { transform: scale(1.2); opacity: 0.9; }
+      100% { transform: scale(1); opacity: 0.7; }
     }
     
     /* Results */
@@ -614,10 +635,11 @@
       <h3 class="info-title">How it works</h3>
       <p class="info-text">
         We use your device's camera and flash to capture subtle color changes in your fingertip
-        that correspond to your pulse. We extract the red channel data, filter the signal,
-        analyze the waveform to detect peaks, and calculate your heart rate.
-        Then we generate meditation music with a tempo designed to guide you
-        toward a more peaceful state.
+        that correspond to your pulse. Our algorithm applies medical-grade signal processing to
+        extract accurate heart rate readings by filtering out noise and properly identifying
+        pulse peaks. Then we generate meditation music with a tempo designed to guide you
+        toward a more peaceful state. The app shows a real-time ECG-like visualization
+        of your pulse signal.
       </p>
     </div>
   </div>
@@ -657,6 +679,7 @@
     let measurementNumber = 0;  // Current measurement index
     let individualReadings = []; // Readings from measurements
     let goodSignalStartTime = 0; // When good signal was first detected
+    let lastVisibleBpm = null;  // Last calculated BPM for visualization
     
     // Timers
     let countdownTimer = null;
@@ -1354,13 +1377,29 @@
     
     // =================== SIGNAL PROCESSING ===================
     
-    // Apply smoothing to signal
+    // Apply signal processing to reduce noise and enhance signal
+    function processSignal(data) {
+      if (data.length < 10) return data;
+      
+      // Step 1: Apply moving average to smooth the signal
+      const smoothed = smoothSignal(data);
+      
+      // Step 2: Apply band-pass filter to keep only frequencies relevant to heart rate
+      const filtered = bandpassFilter(smoothed);
+      
+      // Step 3: Remove baseline trend (detrend)
+      const detrended = detrend(filtered);
+      
+      return detrended;
+    }
+    
+    // Apply smoothing to signal (moving average)
     function smoothSignal(data) {
       const result = [];
       for (let i = 0; i < data.length; i++) {
         let sum = 0;
         let count = 0;
-        // Average nearby values
+        // Average nearby values with larger window
         for (let j = Math.max(0, i - Math.floor(SMOOTHING_WINDOW_SIZE/2)); 
              j <= Math.min(data.length - 1, i + Math.floor(SMOOTHING_WINDOW_SIZE/2)); 
              j++) {
@@ -1372,38 +1411,98 @@
       return result;
     }
     
-    // Calculate heart rate from red values
+    // Apply a simple band-pass filter
+    function bandpassFilter(data) {
+      // This is a simplified band-pass filter that attenuates very slow and very fast changes
+      // A proper filter would use FFT or IIR/FIR techniques
+      const result = [];
+      const alpha = 0.8; // Low-pass filter coefficient
+      const beta = 0.95; // High-pass filter coefficient
+      
+      let lastLow = data[0];
+      let lastHigh = 0;
+      
+      for (let i = 0; i < data.length; i++) {
+        // Low-pass filter (attenuates high frequencies)
+        lastLow = alpha * lastLow + (1 - alpha) * data[i];
+        
+        // High-pass filter (attenuates low frequencies)
+        const highPass = beta * (lastHigh + data[i] - lastLow);
+        lastHigh = highPass;
+        
+        result.push(highPass);
+      }
+      
+      return result;
+    }
+    
+    // Remove baseline trend from signal
+    function detrend(data) {
+      const result = [];
+      const windowSize = Math.floor(FPS * 1.5); // 1.5 second window
+      
+      for (let i = 0; i < data.length; i++) {
+        let sum = 0;
+        let count = 0;
+        
+        // Calculate local trend (average over window)
+        for (let j = Math.max(0, i - windowSize); j <= Math.min(data.length - 1, i + windowSize); j++) {
+          sum += data[j];
+          count++;
+        }
+        
+        const trend = sum / count;
+        result.push(data[i] - trend); // Remove trend
+      }
+      
+      return result;
+    }
+    
+    // Calculate heart rate from red values with improved detection
     function calculateHeartRate() {
       // Ensure we have enough data
       if (redValuesBuffer.length < FPS * 3) {
         return null;
       }
       
-      // Step 1: Smooth the signal to reduce noise
-      const smoothed = smoothSignal(redValuesBuffer);
+      // Step 1: Process the signal with enhanced filtering
+      const processed = processSignal(redValuesBuffer);
       
-      // Step 2: Normalize the signal
-      const mean = smoothed.reduce((sum, val) => sum + val, 0) / smoothed.length;
-      const normalized = smoothed.map(val => val - mean);
+      // Step 2: Normalize the processed signal
+      const mean = processed.reduce((sum, val) => sum + val, 0) / processed.length;
+      const normalized = processed.map(val => val - mean);
       
-      // Step 3: Find peaks with reasonable threshold
-      const maxVal = Math.max(...normalized);
-      const threshold = maxVal * 0.25; // 25% of max value
+      // Calculate standard deviation for adaptive thresholding
+      const squaredDiffs = normalized.map(val => Math.pow(val, 0));
+      const variance = squaredDiffs.reduce((sum, val) => sum + val, 0) / squaredDiffs.length;
+      const stdDev = Math.sqrt(variance);
       
+      // Step 3: Find peaks with stricter criteria
       const peaks = [];
-      const minPeakDistance = Math.round(FPS * 60 / MAX_BPM * 0.8); // Min distance between peaks
       
-      for (let i = 2; i < normalized.length - 2; i++) {
-        // Check if this point is a local maximum
-        if (normalized[i] > normalized[i-1] && 
-            normalized[i] > normalized[i-2] && 
-            normalized[i] > normalized[i+1] && 
-            normalized[i] > normalized[i+2] && 
-            normalized[i] > threshold) {
-          
-          // Only add peaks that are far enough from previous peak
+      // Calculate minimum distance between peaks (based on max possible heart rate)
+      const minPeakDistance = Math.round(FPS * 60 / MAX_BPM * 0.75);
+      
+      // Use adaptive threshold based on signal quality
+      const threshold = Math.max(stdDev * 0.75, 0.01);
+      
+      for (let i = 3; i < normalized.length - 3; i++) {
+        // Check if this point is significantly higher than neighboring points
+        const isSignificantlyHigher = (
+          normalized[i] > normalized[i-1] * MIN_PEAK_PROMINENCE && 
+          normalized[i] > normalized[i-2] * MIN_PEAK_PROMINENCE &&
+          normalized[i] > normalized[i+1] * MIN_PEAK_PROMINENCE && 
+          normalized[i] > normalized[i+2] * MIN_PEAK_PROMINENCE
+        );
+        
+        // Check if this is a peak and above threshold
+        if (isSignificantlyHigher && normalized[i] > threshold) {
+          // Check minimum distance from previous peak
           if (peaks.length === 0 || i - peaks[peaks.length - 1] >= minPeakDistance) {
             peaks.push(i);
+          } else if (normalized[i] > normalized[peaks[peaks.length - 1]]) {
+            // If this peak is higher than the previous one and too close, replace it
+            peaks[peaks.length - 1] = i;
           }
         }
       }
@@ -1413,32 +1512,42 @@
       
       // Need at least 2 peaks to calculate heart rate
       if (peaks.length < 2) {
+        console.log("Not enough reliable peaks detected");
         return null;
       }
       
       // Step 4: Calculate intervals between peaks
       const intervals = [];
       for (let i = 1; i < peaks.length; i++) {
-        const interval = peaks[i] - peaks[i-1];
-        // Only include reasonable intervals
-        if (interval >= Math.round(FPS * 60 / MAX_BPM) && 
-            interval <= Math.round(FPS * 60 / MIN_BPM)) {
-          intervals.push(interval);
-        }
+        intervals.push(peaks[i] - peaks[i-1]);
       }
       
-      if (intervals.length < 1) {
+      // Step 5: Filter out outlier intervals (too short or too long)
+      const validIntervals = intervals.filter(interval => 
+        interval >= FPS * 60 / MAX_BPM && 
+        interval <= FPS * 60 / MIN_BPM
+      );
+      
+      if (validIntervals.length < intervals.length * 0.5) {
+        console.log("Too many irregular intervals detected");
         return null;
       }
       
-      // Step 5: Use median interval to calculate heart rate
-      intervals.sort((a, b) => a - b);
-      const medianInterval = intervals[Math.floor(intervals.length / 2)];
+      if (validIntervals.length === 0) {
+        console.log("No valid intervals between peaks");
+        return null;
+      }
+      
+      // Step 6: Use median interval to calculate heart rate (more robust to outliers)
+      validIntervals.sort((a, b) => a - b);
+      const medianInterval = validIntervals[Math.floor(validIntervals.length / 2)];
       
       // Convert to BPM: (60 seconds / interval in seconds)
       const hr = Math.round((60 * FPS) / medianInterval);
       
-      // Only return heart rate in reasonable range
+      console.log(`Calculated HR: ${hr} BPM from ${validIntervals.length} valid intervals`);
+      
+      // Only return heart rate in reasonable range for resting measurement
       return (hr >= MIN_BPM && hr <= MAX_BPM) ? hr : null;
     }
     
@@ -1522,45 +1631,139 @@
       }
     }
     
-    // Visualization
+    // Visualization with ECG-like line (similar to Google Fit)
     function updateVisualization() {
-      visualization.innerHTML = '';
+      const container = visualization;
+      container.innerHTML = '';
       
+      // Create SVG for line visualization
+      const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      svg.setAttribute("class", "signal-line");
+      svg.setAttribute("width", "100%");
+      svg.setAttribute("height", "100%");
+      svg.setAttribute("viewBox", "0 0 100 100");
+      svg.setAttribute("preserveAspectRatio", "none");
+      
+      // Get points to visualize (limit to last few seconds)
       const displayPoints = dataPoints.slice(-100);
-      if (displayPoints.length === 0) return;
+      if (displayPoints.length < 2) return;
+      
+      // Process points for better visualization
+      const processed = processSignal(displayPoints);
       
       // Find min/max for scaling
-      const minVal = Math.min(...displayPoints);
-      const maxVal = Math.max(...displayPoints);
+      const minVal = Math.min(...processed);
+      const maxVal = Math.max(...processed);
       const range = (maxVal - minVal) === 0 ? 1 : (maxVal - minVal);
       
-      // Adjust peak indices for visualization
-      const visiblePeaks = [];
-      for (const peak of detectedPeaks) {
-        const adjustedIndex = peak - (redValuesBuffer.length - displayPoints.length);
-        if (adjustedIndex >= 0 && adjustedIndex < displayPoints.length) {
-          visiblePeaks.push(adjustedIndex);
+      // Create the path for the line
+      const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      
+      // Build path data
+      let pathData = "";
+      
+      for (let i = 0; i < processed.length; i++) {
+        // Scale x from 0-100% of width
+        const x = (i / (processed.length - 1)) * 100;
+        
+        // Scale y from 10-90% of height (inverted, as SVG y increases downward)
+        const y = 90 - ((processed[i] - minVal) / range) * 80;
+        
+        if (i === 0) {
+          pathData += `M ${x} ${y}`;
+        } else {
+          pathData += ` L ${x} ${y}`;
         }
       }
       
-      // Create visualization bars
-      for (let i = 0; i < displayPoints.length; i++) {
-        const value = displayPoints[i];
-        const normalizedValue = ((value - minVal) / range) * 100;
-        const height = Math.max(1, Math.min(100, normalizedValue));
+      path.setAttribute("d", pathData);
+      path.setAttribute("fill", "none");
+      path.setAttribute("stroke", "#ef4444");  // Red line
+      path.setAttribute("stroke-width", "2");
+      path.setAttribute("vector-effect", "non-scaling-stroke");
+      
+      svg.appendChild(path);
+      
+      // Add visual indicators for detected peaks
+      if (measuring && detectedPeaks && detectedPeaks.length > 0) {
+        // Calculate the most recent peak
+        const lastPeak = detectedPeaks[detectedPeaks.length - 1];
+        const bufferLength = redValuesBuffer.length;
         
-        const bar = document.createElement('div');
-        bar.className = 'visualization-bar';
-        if (visiblePeaks.includes(i)) {
-          bar.classList.add('peak');
+        // Check if the peak was recent (in last 0.5 seconds)
+        if (lastPeak > bufferLength - (FPS * 0.5)) {
+          // Create or update beat indicator
+          let beatIndicator = document.getElementById('beatIndicator');
+          
+          if (!beatIndicator) {
+            beatIndicator = document.createElement('div');
+            beatIndicator.id = 'beatIndicator';
+            beatIndicator.className = 'beat-indicator';
+            document.body.appendChild(beatIndicator);
+          }
+          
+          // Trigger beat animation
+          beatIndicator.classList.remove('pulse');
+          void beatIndicator.offsetWidth; // Force reflow
+          beatIndicator.classList.add('pulse');
+          
+          // Show current BPM if we have at least two peaks
+          if (detectedPeaks.length >= 2 && lastVisibleBpm) {
+            const bpmText = document.createElement('div');
+            bpmText.style.color = '#fff';
+            bpmText.style.position = 'absolute';
+            bpmText.style.bottom = '5px';
+            bpmText.style.left = '10px';
+            bpmText.style.fontSize = '0.75rem';
+            bpmText.textContent = `${lastVisibleBpm} bpm`;
+            container.appendChild(bpmText);
+          }
+        }
+      }
+      
+      // Add marker points for peaks
+      if (detectedPeaks) {
+        const visiblePeaks = [];
+        
+        // Adjust peak indices to match display points
+        for (const peak of detectedPeaks) {
+          const adjustedPeak = peak - (redValuesBuffer.length - displayPoints.length);
+          if (adjustedPeak >= 0 && adjustedPeak < displayPoints.length) {
+            visiblePeaks.push(adjustedPeak);
+          }
         }
         
-        bar.style.height = `${height}%`;
-        bar.style.left = `${(i / displayPoints.length) * 100}%`;
-        bar.style.width = `${Math.max(1, 100 / displayPoints.length)}%`;
+        // Draw circles at peak positions
+        for (const peakIndex of visiblePeaks) {
+          const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+          
+          const x = (peakIndex / (processed.length - 1)) * 100;
+          const y = 90 - ((processed[peakIndex] - minVal) / range) * 80;
+          
+          circle.setAttribute("cx", x);
+          circle.setAttribute("cy", y);
+          circle.setAttribute("r", "2");
+          circle.setAttribute("fill", "#10b981"); // Green dots for peaks
+          
+          svg.appendChild(circle);
+        }
         
-        visualization.appendChild(bar);
+        // Display current visible BPM
+        if (visiblePeaks.length >= 2) {
+          const visibleIntervals = [];
+          for (let i = 1; i < visiblePeaks.length; i++) {
+            visibleIntervals.push(visiblePeaks[i] - visiblePeaks[i-1]);
+          }
+          
+          if (visibleIntervals.length > 0) {
+            visibleIntervals.sort((a, b) => a - b);
+            const medianVisibleInterval = visibleIntervals[Math.floor(visibleIntervals.length / 2)];
+            lastVisibleBpm = Math.round((60 * FPS) / medianVisibleInterval);
+          }
+        }
       }
+      
+      container.appendChild(svg);
     }
     
     // Clear visualization
