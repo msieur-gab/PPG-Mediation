@@ -1,1 +1,1556 @@
+// Start interactive positioning phase
+    async function startPositioning() {
+      // Clear any existing timers
+      if (frameProcessorId) cancelAnimationFrame(frameProcessorId);
+      
+      // Initialize state
+      positioning = true;
+      measuring = false;
+      redValuesBuffer = [];
+      dataPoints = [];
+      goodSignalStartTime = 0;
+      
+      // Update UI
+      initialState.classList.add('hidden');
+      resultsState.classList.add('hidden');
+      measuringState.classList.add('hidden');
+      positioningState.classList.remove('hidden');
+      cameraError.classList.add('hidden');
+      
+      try {
+        // Start camera
+        const cameraStarted = await startCameraWithFacing(cameraFacing);
+        
+        if (!cameraStarted) {
+          stopPositioning();
+          initialState.classList.remove('hidden');
+          return;
+        }
+        
+        // Start processing frames for positioning
+        frameProcessorId = requestAnimationFrame(processPositioningFrame);
+        
+      } catch (error) {
+        console.error('Error starting positioning:', error);
+        showCameraError('An error occurred. Please try again.');
+        stopPositioning();
+        initialState.classList.remove('hidden');
+      }
+    }
+    
+    // Start the actual measurement phase
+    function startMeasuring() {
+      // Stop positioning phase
+      positioning = false;
+      if (frameProcessorId) {
+        cancelAnimationFrame(frameProcessorId);
+        frameProcessorId = null;
+      }
+      
+      // Auto-enable flash for measurement if supported
+      if (flashSupported && !flashActive) {
+        toggleFlash();
+      }
+      
+      // Initialize measurement state
+      measuring = true;
+      countdown = 5;
+      redValuesBuffer = [];
+      dataPoints = [];
+      measurementNumber = 0;
+      individualReadings = [];
+      detectedPeaks = [];
+      
+      // Update UI
+      positioningState.classList.add('hidden');
+      measuringState.classList.remove('hidden');
+      
+      countdownElement.textContent = countdown;
+      countdownElement.classList.add('pulse');
+      clearVisualization();
+      updateMeasurementIndicators();
+      clearReadings();
+      
+      // Begin countdown
+      countdownTimer = setInterval(() => {
+        countdown--;
+        countdownElement.textContent = countdown;
+        
+        if (countdown <= 0) {
+          clearInterval(countdownTimer);
+          countdownTimer = null;
+          countdownElement.classList.remove('pulse');
+          measurementNumber = 1;
+          startSingleMeasurement();
+        }
+      }, 1000);
+    }
+    
+    // Stop positioning phase
+    function stopPositioning() {
+      positioning = false;
+      
+      if (frameProcessorId) {
+        cancelAnimationFrame(frameProcessorId);
+        frameProcessorId = null;
+      }
+      
+      // Turn off flash
+      if (flashActive && stream) {
+        const track = stream.getVideoTracks()[0];
+        if (track) {
+          track.applyConstraints({ advanced: [{ torch: false }] });
+          flashActive = false;
+        }
+      }
+      
+      // Stop video stream
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+        stream = null;
+      }
+      
+      flashToggleBtn.classList.add('hidden');
+    }    // Process video frame during positioning phase
+    function processPositioningFrame() {
+      if (!processingVideo || !processingCanvas || !positioning || !stream || processingVideo.paused) return;
+      
+      const video = processingVideo;
+      const canvas = processingCanvas;
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      
+      // Ensure canvas size is correct
+      if (canvas.width !== 150 || canvas.height !== 150) {
+        canvas.width = 150;
+        canvas.height = 150;
+      }
+      
+      if (video.videoWidth > 0 && video.videoHeight > 0) {
+        // Draw center crop from video to canvas
+        const srcX = (video.videoWidth - canvas.width) / 2;
+        const srcY = (video.videoHeight - canvas.height) / 2;
+        ctx.drawImage(video, srcX, srcY, canvas.width, canvas.height, 0, 0, canvas.width, canvas.height);
+        
+        // Extract values from center ROI
+        const roiX = canvas.width / 2 - 20;
+        const roiY = canvas.height / 2 - 20;
+        const roiWidth = 40;
+        const roiHeight = 40;
+        const pixelData = ctx.getImageData(roiX, roiY, roiWidth, roiHeight).data;
+        
+        // Calculate RGB values and signal quality metrics
+        let totalRed = 0, totalGreen = 0, totalBlue = 0;
+        let pixelCount = 0;
+        
+        for (let i = 0; i < pixelData.length; i += 4) {
+          totalRed += pixelData[i];
+          totalGreen += pixelData[i + 1];
+          totalBlue += pixelData[i + 2];
+          pixelCount++;
+        }
+        
+        const avgRed = pixelCount > 0 ? totalRed / pixelCount : 0;
+        const avgGreen = pixelCount > 0 ? totalGreen / pixelCount : 0;
+        const avgBlue = pixelCount > 0 ? totalBlue / pixelCount : 0;
+        
+        // Add to buffer and maintain size for visualization
+        redValuesBuffer.push(avgRed);
+        if (redValuesBuffer.length > 30) { // Show last second of data during positioning
+          redValuesBuffer.shift();
+        }
+        
+        // Calculate signal quality metrics
+        // 1. Red channel should be high (finger is present)
+        // 2. Red should dominate over other channels (proper illumination)
+        // 3. Values should be stable over time (finger is steady)
+        
+        // Finger presence detection (based on red value)
+        const fingerPresent = avgRed > 150;
+        
+        // Red channel dominance
+        const redDominance = (avgRed > 0) ? 
+          (avgRed - Math.max(avgGreen, avgBlue)) / avgRed : 0;
+        
+        // Signal stability (low variation in last few frames)
+        let stability = 1.0;
+        if (redValuesBuffer.length > 10) {
+          const recent = redValuesBuffer.slice(-10);
+          const mean = recent.reduce((a, b) => a + b, 0) / recent.length;
+          const variance = recent.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / recent.length;
+          const standardDeviation = Math.sqrt(variance);
+          // Higher standard deviation = less stable = lower quality
+          stability = Math.max(0, 1 - (standardDeviation / 50));
+        }
+        
+        // Overall signal quality (weighted combination)
+        let signalQuality = 0;
+        if (fingerPresent) {
+          signalQuality = 0.4 * Math.min(avgRed / 220, 1) + // Red brightness
+                          0.3 * redDominance + // Red dominance
+                          0.3 * stability; // Signal stability
+        }
+        
+        // Update quality meter
+        qualityFill.style.width = `${signalQuality * 100}%`;
+        if (signalQuality > GOOD_SIGNAL_THRESHOLD) {
+          qualityFill.className = 'quality-fill good';
+          positioningMessage.textContent = "Great! Hold steady...";
+          
+          // Check if good signal has been maintained
+          const now = Date.now();
+          if (goodSignalStartTime === 0) {
+            goodSignalStartTime = now;
+          } else if (now - goodSignalStartTime > GOOD_SIGNAL_DURATION * 1000) {
+            // Auto-start measurement after sustained good signal
+            startMeasuring();
+            return;
+          }
+        } else if (signalQuality > FAIR_SIGNAL_THRESHOLD) {
+          qualityFill.className = 'quality-fill fair';
+          positioningMessage.textContent = "Almost there...adjust position slightly";
+          goodSignalStartTime = 0; // Reset good signal timer
+        } else if (fingerPresent) {
+          qualityFill.className = 'quality-fill';
+          positioningMessage.textContent = "Reposition your finger in the red box";
+          goodSignalStartTime = 0; // Reset good signal timer
+        } else {
+          qualityFill.className = 'quality-fill';
+          qualityFill.style.width = "0%";
+          positioningMessage.textContent = "Place your finger over the camera";
+          goodSignalStartTime = 0; // Reset good signal timer
+        }
+        
+        // Update data for visualization
+        dataPoints = [...redValuesBuffer];
+        updateVisualization();
+      }
+      
+      // Draw ROI box on preview
+      if (previewCanvas) {
+        const previewCtx = previewCanvas.getContext('2d');
+        previewCtx.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
+        previewCtx.strokeStyle = 'red';
+        previewCtx.lineWidth = 2;
+        const previewRoiX = previewCanvas.width / 2 - 20;
+        const previewRoiY = previewCanvas.height / 2 - 20;
+        previewCtx.strokeRect(previewRoiX, previewRoiY, 40, 40);
+      }
+      
+      // Continue processing frames
+      if (positioning) {
+        frameProcessorId = requestAnimationFrame(processPositioningFrame);
+      }
+    }<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Rhythm Breath - Heart Rate Based Meditation</title>
+  <style>
+    /* Base styles */
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+      margin: 0;
+      padding: 0;
+      background-color: #f3f4f6;
+      color: #374151;
+    }
+    
+    .container {
+      max-width: 480px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+    
+    .hidden {
+      display: none !important;
+    }
+    
+    /* Header */
+    .header {
+      text-align: center;
+      margin-bottom: 24px;
+    }
+    
+    .app-title {
+      font-size: 1.5rem;
+      font-weight: 700;
+      color: #4f46e5;
+      margin-bottom: 8px;
+    }
+    
+    .app-subtitle {
+      color: #6b7280;
+      font-size: 0.9rem;
+      margin-top: 0;
+    }
+    
+    /* Main card */
+    .card {
+      background-color: white;
+      border-radius: 8px;
+      padding: 16px;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+      margin-bottom: 24px;
+      text-align: center;
+    }
+    
+    /* Camera section */
+    .camera-icon {
+      background-color: #fee2e2;
+      width: 80px;
+      height: 80px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin: 0 auto 16px auto;
+    }
+    
+    .camera-instruction {
+      margin-bottom: 16px;
+    }
+    
+    .camera-toggle, .flash-toggle {
+      background: none;
+      border: none;
+      color: #4f46e5;
+      font-size: 0.875rem;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      margin: 8px auto 16px auto;
+    }
+    
+    .camera-toggle svg, .flash-toggle svg {
+      margin-right: 4px;
+    }
+    
+    .camera-error {
+      color: #ef4444;
+      font-size: 0.875rem;
+      margin-bottom: 16px;
+    }
+    
+    /* Camera preview */
+    .preview-container {
+      position: relative;
+      width: 128px;
+      height: 128px;
+      margin: 0 auto 16px auto;
+    }
+    
+    .camera-preview {
+      width: 128px;
+      height: 128px;
+      border-radius: 8px;
+      border: 2px solid #f87171;
+      object-fit: cover;
+    }
+    
+    .preview-overlay {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+    }
+    
+    .preview-help {
+      font-size: 0.75rem;
+      color: #6b7280;
+      margin-top: 4px;
+    }
+    
+    /* Countdown */
+    .countdown {
+      width: 64px;
+      height: 64px;
+      background-color: #ef4444;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: white;
+      font-weight: 700;
+      font-size: 1.25rem;
+      margin: 0 auto 8px auto;
+    }
+    
+    .countdown.pulse {
+      animation: pulse 1.5s infinite;
+    }
+    
+    @keyframes pulse {
+      0% {
+        transform: scale(0.95);
+        box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7);
+      }
+      
+      70% {
+        transform: scale(1);
+        box-shadow: 0 0 0 10px rgba(239, 68, 68, 0);
+      }
+      
+      100% {
+        transform: scale(0.95);
+        box-shadow: 0 0 0 0 rgba(239, 68, 68, 0);
+      }
+    }
+    
+    .keep-steady {
+      margin-bottom: 8px;
+    }
+    
+    /* Measurement indicators */
+    .measurement-indicators {
+      display: flex;
+      justify-content: center;
+      gap: 8px;
+      margin-top: 8px;
+    }
+    
+    .indicator {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background-color: #d1d5db; /* Default gray */
+    }
+    
+    .indicator.active {
+      background-color: #ef4444; /* Red for active */
+      animation: pulse 1.5s infinite;
+    }
+    
+    .indicator.complete {
+      background-color: #10b981; /* Green for complete */
+    }
 
+    .indicator.failed {
+      background-color: #f59e0b; /* Amber/Orange for failed */
+    }
+    
+    /* Readings display */
+    .readings {
+      display: flex;
+      justify-content: center;
+      gap: 16px;
+      margin-top: 12px;
+      font-size: 0.75rem;
+    }
+    
+    .reading {
+      display: flex;
+      align-items: center;
+    }
+    
+    .reading-value {
+      font-weight: 500;
+    }
+    
+    .reading-unit {
+      color: #6b7280;
+    }
+    
+    /* Signal visualization */
+    .visualization {
+      height: 64px;
+      width: 100%;
+      background-color: #f3f4f6;
+      position: relative;
+      overflow: hidden;
+      margin-top: 16px;
+    }
+    
+    .visualization-bar {
+      position: absolute;
+      bottom: 0;
+      width: 4px;
+      background-color: #ef4444;
+      opacity: 0.7;
+    }
+    
+    .visualization-bar.peak {
+      background-color: #10b981; /* Green for peaks */
+      opacity: 1;
+    }
+    
+    /* Results */
+    .heart-rate {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 8px;
+    }
+    
+    .heart-rate-value {
+      font-size: 1.5rem;
+      font-weight: 700;
+      margin-left: 8px;
+    }
+    
+    .result-readings {
+      display: flex;
+      justify-content: center;
+      flex-wrap: wrap; /* Allow readings to wrap if many */
+      margin-bottom: 16px;
+      font-size: 0.875rem;
+    }
+    
+    .result-reading {
+      margin: 0 8px;
+      display: flex;
+      align-items: center;
+    }
+    
+    .tempo-box {
+      background-color: #eef2ff;
+      padding: 12px;
+      border-radius: 8px;
+      margin-bottom: 16px;
+    }
+    
+    .tempo-value {
+      font-weight: 700;
+    }
+    
+    .tempo-note {
+      font-size: 0.875rem;
+      color: #6b7280;
+      margin-top: 4px;
+    }
+    
+    /* Buttons */
+    .btn {
+      padding: 8px 24px;
+      border-radius: 8px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background-color 0.2s ease;
+      border: none;
+      display: inline-flex;
+      align-items: center;
+      margin-top: 8px;
+    }
+    
+    .btn-primary {
+      background-color: #4f46e5;
+      color: white;
+    }
+    
+    .btn-primary:hover {
+      background-color: #4338ca;
+    }
+    
+    .btn-success {
+      background-color: #10b981;
+      color: white;
+    }
+    
+    .btn-success:hover {
+      background-color: #059669;
+    }
+     .btn-success.btn-disabled {
+      background-color: #a0aec0;
+      cursor: not-allowed;
+      opacity: 0.7;
+    }
+    
+    .btn-danger {
+      background-color: #ef4444;
+      color: white;
+    }
+    
+    .btn-danger:hover {
+      background-color: #dc2626;
+    }
+    
+    .btn-link {
+      background: none;
+      color: #4f46e5;
+      padding: 0;
+    }
+    
+    .btn-link:hover {
+      color: #4338ca;
+    }
+    
+    .btn svg {
+      margin-right: 4px;
+    }
+    
+    /* Meditation progress */
+    .meditation-section {
+      margin-bottom: 24px;
+    }
+    
+    .progress-bar {
+      height: 12px;
+      background-color: #e5e7eb;
+      border-radius: 999px;
+      overflow: hidden;
+    }
+    
+    .progress-fill {
+      height: 100%;
+      background-color: #10b981;
+      transition: width 0.3s ease-out;
+    }
+    
+    .progress-times {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.75rem;
+      color: #6b7280;
+      margin-top: 4px;
+    }
+    
+    .current-track {
+      font-size: 0.875rem;
+      color: #6b7280;
+      margin-top: 8px;
+    }
+    
+    .track-name {
+      font-weight: 500;
+    }
+    
+    /* Info box */
+    .info-box {
+      background-color: #eef2ff;
+      padding: 16px;
+      border-radius: 8px;
+    }
+    
+    .info-title {
+      font-weight: 600;
+      color: #1e40af;
+      margin-top: 0;
+      margin-bottom: 8px;
+    }
+    
+    .info-text {
+      font-size: 0.875rem;
+      color: #4b5563;
+      margin: 0;
+    }
+
+    /* Icons */
+    .icon {
+      display: inline-block;
+      width: 24px;
+      height: 24px;
+      stroke-width: 2;
+      stroke: currentColor;
+      fill: none;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+    
+    .icon-sm {
+      width: 16px;
+      height: 16px;
+    }
+    
+    .icon-xs {
+      width: 12px;
+      height: 12px;
+    }
+    
+    .icon-lg {
+      width: 48px;
+      height: 48px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1 class="app-title">Rhythm Breath</h1>
+      <p class="app-subtitle">Personalized meditation based on your heart rhythm</p>
+    </div>
+    
+    <div class="hidden">
+      <video id="processingVideo" playsinline muted></video>
+      <canvas id="processingCanvas"></canvas>
+    </div>
+    
+    <div class="card" id="mainCard">
+      <div id="initialState">
+        <div class="camera-icon">
+          <svg class="icon icon-lg" viewBox="0 0 24 24">
+            <rect x="2" y="6" width="20" height="12" rx="2" ry="2"></rect>
+            <circle cx="12" cy="12" r="3"></circle>
+          </svg>
+        </div>
+        <p class="camera-instruction">Place your thumb over your camera lens to measure your heart rate</p>
+        
+        <button id="cameraToggle" class="camera-toggle hidden">
+          <svg class="icon icon-sm" viewBox="0 0 24 24">
+            <path d="M23 4v6h-6"></path>
+            <path d="M1 20v-6h6"></path>
+            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"></path>
+            <path d="M20.49 15a9 9 0 0 1-14.85 3.36L1 14"></path>
+          </svg>
+          Switch to front camera
+        </button>
+        
+        <div id="cameraError" class="camera-error hidden"></div>
+        
+        <button id="startMeasurementBtn" class="btn btn-primary">Start Measurement</button>
+      </div>
+      
+      <div id="positioningState" class="hidden">
+        <div class="preview-container" id="previewContainer">
+          <video id="previewVideo" class="camera-preview" playsinline muted autoplay></video>
+          <canvas id="previewCanvas" class="preview-overlay" width="128" height="128"></canvas>
+          <div class="target-area"></div>
+        </div>
+        
+        <button id="flashToggleBtn" class="flash-toggle btn btn-link hidden">
+            <svg class="icon icon-sm" viewBox="0 0 24 24" id="flashIcon">
+                <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+            </svg>
+            <span id="flashToggleText">Turn Flash On</span>
+        </button>
+        
+        <div class="preview-help">Place your fingertip in the red box</div>
+        
+        <div class="signal-quality-meter">
+          <div id="qualityFill" class="quality-fill"></div>
+        </div>
+        
+        <p id="positioningMessage" class="positioning-message">Waiting for finger detection...</p>
+        
+        <button id="skipPositioningBtn" class="btn btn-link">
+          Skip positioning
+        </button>
+      </div>
+      
+      <div id="measuringState" class="hidden">
+        <div class="preview-container" id="previewContainer">
+          <video id="previewVideo" class="camera-preview" playsinline muted autoplay></video>
+          <canvas id="previewCanvas" class="preview-overlay" width="128" height="128"></canvas>
+          <div class="target-area"></div>
+          <div class="preview-help">Center your fingertip in the red box</div>
+        </div>
+
+        <button id="flashToggleBtn" class="flash-toggle btn btn-link hidden">
+            <svg class="icon icon-sm" viewBox="0 0 24 24" id="flashIcon">
+                <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+            </svg>
+            <span id="flashToggleText">Turn Flash On</span>
+        </button>
+        
+        <div id="countdown" class="countdown pulse">5</div>
+        <p class="keep-steady">Keep your thumb steady...</p>
+        
+        <div class="measurement-indicators" id="measurementIndicators">
+          <div class="indicator"></div>
+          <div class="indicator"></div>
+          <div class="indicator"></div>
+        </div>
+        
+        <div id="readings" class="readings"></div>
+        
+        <div id="visualization" class="visualization"></div>
+      </div>
+      
+      <div id="resultsState" class="hidden">
+        <div class="heart-rate">
+          <svg class="icon" viewBox="0 0 24 24">
+            <path d="M22 12h-4l-3 9L9 3l-3 9H2"></path>
+          </svg>
+          <span id="heartRateValue" class="heart-rate-value">72 BPM</span>
+        </div>
+        
+        <div id="resultReadings" class="result-readings"></div>
+        
+        <div class="tempo-box">
+          <p>Recommended music tempo: <span id="tempoValue" class="tempo-value">60 BPM</span></p>
+          <p class="tempo-note">Music at this tempo will help guide your heart rate toward a more relaxed state</p>
+        </div>
+        
+        <button id="remeasureBtn" class="btn btn-link">
+          <svg class="icon icon-sm" viewBox="0 0 24 24">
+            <path d="M23 4v6h-6"></path>
+            <path d="M1 20v-6h6"></path>
+            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"></path>
+            <path d="M20.49 15a9 9 0 0 1-14.85 3.36L1 14"></path>
+          </svg>
+          Re-measure
+        </button>
+        
+        <button id="startSessionBtn" class="btn btn-success">
+          <svg class="icon icon-sm" viewBox="0 0 24 24">
+            <polygon points="5 3 19 12 5 21 5 3"></polygon>
+          </svg>
+          Start Session
+        </button>
+        
+        <button id="endSessionBtn" class="btn btn-danger hidden">
+          <svg class="icon icon-sm" viewBox="0 0 24 24">
+            <rect x="6" y="4" width="4" height="16"></rect>
+            <rect x="14" y="4" width="4" height="16"></rect>
+          </svg>
+          End Session
+        </button>
+      </div>
+    </div>
+    
+    <div id="meditationSection" class="meditation-section hidden">
+      <div class="progress-bar">
+        <div id="progressFill" class="progress-fill" style="width: 0%"></div>
+      </div>
+      <div class="progress-times">
+        <span>0:00</span>
+        <span>10:00</span>
+      </div>
+      <p class="current-track">
+        Currently playing: <span class="track-name">Ocean Calm</span> (<span id="currentTempo">60</span> BPM)
+      </p>
+    </div>
+    
+    <div class="info-box">
+      <h3 class="info-title">How it works</h3>
+      <p class="info-text">
+        We use your device's camera and flash to capture subtle color changes in your fingertip
+        that correspond to your pulse. We extract the red channel data, filter the signal,
+        analyze the waveform to detect peaks, and calculate your heart rate.
+        Then we generate meditation music with a tempo designed to guide you
+        toward a more peaceful state.
+      </p>
+    </div>
+  </div>
+
+  <script>
+    // Configuration
+    const FPS = 30;
+    const MEASUREMENT_DURATION = 8; // seconds
+    const BUFFER_SIZE = FPS * MEASUREMENT_DURATION;
+    const TOTAL_MEASUREMENTS = 3;
+    const FAILED_MEASUREMENT_TEXT = "Failed"; 
+    const SMOOTHING_WINDOW_SIZE = 5; // Reduced for better peak detection
+    const MIN_BPM = 45;
+    const MAX_BPM = 190;
+    const GOOD_SIGNAL_THRESHOLD = 0.85; // 85% quality for good signal
+    const FAIR_SIGNAL_THRESHOLD = 0.5;  // 50% quality for fair signal
+    const GOOD_SIGNAL_DURATION = 1.5;   // Seconds of good signal before auto-starting
+
+    // State variables
+    let measuring = false;
+    let positioning = false;
+    let heartRate = null;
+    let recommendedTempo = null;
+    let countdown = 5;
+    let meditationActive = false;
+    let progress = 0;
+    let dataPoints = [];
+    let stream = null;
+    let measurementNumber = 0;
+    let individualReadings = []; 
+    let cameraFacing = 'environment'; 
+    let availableCameras = [];
+    let flashSupported = false;
+    let flashActive = false;
+    let countdownTimer = null;
+    let measurementTimer = null;
+    let frameProcessorId = null;
+    let animationId = null;
+    let goodSignalStartTime = 0; // When good signal was first detected
+    
+    // DOM elements
+    const initialState = document.getElementById('initialState');
+    const positioningState = document.getElementById('positioningState');
+    const measuringState = document.getElementById('measuringState');
+    const resultsState = document.getElementById('resultsState');
+    const meditationSection = document.getElementById('meditationSection');
+    
+    const processingVideo = document.getElementById('processingVideo');
+    const processingCanvas = document.getElementById('processingCanvas');
+    const previewVideo = document.getElementById('previewVideo');
+    const previewCanvas = document.getElementById('previewCanvas');
+    
+    const startMeasurementBtn = document.getElementById('startMeasurementBtn');
+    const cameraToggle = document.getElementById('cameraToggle');
+    const cameraError = document.getElementById('cameraError');
+    const countdownElement = document.getElementById('countdown');
+    const measurementIndicators = document.getElementById('measurementIndicators');
+    const readings = document.getElementById('readings');
+    const visualization = document.getElementById('visualization');
+    
+    const heartRateValue = document.getElementById('heartRateValue');
+    const resultReadings = document.getElementById('resultReadings');
+    const tempoValue = document.getElementById('tempoValue');
+    const remeasureBtn = document.getElementById('remeasureBtn');
+    const startSessionBtn = document.getElementById('startSessionBtn');
+    const endSessionBtn = document.getElementById('endSessionBtn');
+    
+    const progressFill = document.getElementById('progressFill');
+    const currentTempo = document.getElementById('currentTempo');
+
+    const flashToggleBtn = document.getElementById('flashToggleBtn'); 
+    const flashToggleText = document.getElementById('flashToggleText');
+    
+    const qualityFill = document.getElementById('qualityFill');
+    const positioningMessage = document.getElementById('positioningMessage');
+    const skipPositioningBtn = document.getElementById('skipPositioningBtn');
+    
+    // Variables for processing
+    let redValuesBuffer = [];
+    let detectedPeaks = [];
+    
+    // Check available cameras on page load
+    async function checkCameras() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+        showCameraError("Camera features are not supported by your browser or device.");
+        return;
+      }
+
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        availableCameras = devices.filter(device => device.kind === 'videoinput');
+        
+        // Show camera toggle if multiple cameras
+        cameraToggle.classList.toggle('hidden', availableCameras.length <= 1);
+        
+        // Set default camera facing
+        if (availableCameras.length === 1) {
+          const caps = availableCameras[0].getCapabilities ? availableCameras[0].getCapabilities() : null;
+          if (caps && caps.facingMode && caps.facingMode.includes('user')) {
+            cameraFacing = 'user';
+          }
+        }
+        
+        updateCameraToggleText();
+      } catch (error) {
+        console.error('Error enumerating devices:', error);
+        showCameraError('Could not access camera list. Check permissions.');
+      }
+    }
+    
+    // Update camera toggle button text
+    function updateCameraToggleText() {
+      cameraToggle.innerHTML = `
+        <svg class="icon icon-sm" viewBox="0 0 24 24">
+          <path d="M23 4v6h-6"></path>
+          <path d="M1 20v-6h6"></path>
+          <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"></path>
+          <path d="M20.49 15a9 9 0 0 1-14.85 3.36L1 14"></path>
+        </svg>
+        Switch to ${cameraFacing === 'environment' ? 'front' : 'back'} camera
+      `;
+    }
+    
+    // Toggle between front and back cameras
+    async function toggleCamera() {
+      // Turn off flash when switching cameras
+      if (flashActive) {
+        await toggleFlash();
+      }
+      
+      // Stop current stream
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+        stream = null;
+      }
+      
+      // Toggle camera facing
+      cameraFacing = cameraFacing === 'environment' ? 'user' : 'environment';
+      updateCameraToggleText();
+      
+      // Reset flash state
+      flashSupported = false;
+      flashActive = false;
+      updateFlashButtonUI();
+      
+      // Restart camera if currently measuring
+      if (measuring) {
+        try {
+          await startCameraWithFacing(cameraFacing);
+        } catch (err) {
+          console.error("Error switching camera:", err);
+          showCameraError("Failed to switch camera. Try remeasuring.");
+          stopMeasuring();
+          initialState.classList.remove('hidden');
+          measuringState.classList.add('hidden');
+        }
+      }
+    }
+
+    // Update flash button visibility and text
+    function updateFlashButtonUI() {
+      flashToggleBtn.classList.toggle('hidden', !flashSupported || !measuring);
+      flashToggleText.textContent = flashActive ? 'Turn Flash Off' : 'Turn Flash On';
+    }
+
+    // Toggle flash on/off
+    async function toggleFlash() {
+      if (!stream || !flashSupported) return;
+      
+      const track = stream.getVideoTracks()[0];
+      if (!track) return;
+      
+      try {
+        flashActive = !flashActive;
+        await track.applyConstraints({ advanced: [{ torch: flashActive }] });
+        updateFlashButtonUI();
+      } catch (err) {
+        console.error("Flash toggle error:", err);
+        flashActive = !flashActive; // Revert state change
+        showCameraError("Could not control flash. Try a different camera.");
+      }
+    }
+    
+    // Start camera with specific facing mode
+    async function startCameraWithFacing(facing) {
+      if (!navigator.mediaDevices) {
+        showCameraError("Camera access not supported by your browser.");
+        return false;
+      }
+      
+      try {
+        cameraError.classList.add('hidden');
+        
+        // Request camera access
+        const constraints = {
+          video: {
+            facingMode: facing,
+            width: { ideal: 640 },
+            height: { ideal: 480 },
+            frameRate: { ideal: FPS }
+          }
+        };
+        
+        const mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+        stream = mediaStream;
+        
+        // Set video sources
+        processingVideo.srcObject = mediaStream;
+        previewVideo.srcObject = mediaStream;
+        
+        // Start video playback
+        await processingVideo.play();
+        await previewVideo.play();
+        
+        // Check flash support
+        const track = stream.getVideoTracks()[0];
+        if (track && track.getCapabilities) {
+          const capabilities = track.getCapabilities();
+          flashSupported = !!capabilities.torch;
+          
+          // Show flash toggle
+          updateFlashButtonUI();
+        }
+        
+        return true;
+      } catch (error) {
+        console.error(`Camera error:`, error);
+        
+        // Display user-friendly error message
+        let errorMessage = "Could not access camera. Check permissions.";
+        if (error.name === 'NotAllowedError') {
+          errorMessage = "Camera access denied. Please allow camera permissions.";
+        } else if (error.name === 'NotFoundError') {
+          errorMessage = "No camera found. Please check your device.";
+        }
+        
+        showCameraError(errorMessage);
+        
+        // Try front camera as fallback
+        if (facing === 'environment' && !error.name === 'NotAllowedError') {
+          try {
+            console.log("Trying front camera as fallback");
+            cameraFacing = 'user';
+            updateCameraToggleText();
+            return await startCameraWithFacing('user');
+          } catch {
+            return false;
+          }
+        }
+        
+        return false;
+      }
+    }
+    
+    // Show camera error message
+    function showCameraError(message) {
+      cameraError.textContent = message;
+      cameraError.classList.remove('hidden');
+    }
+    
+    // Process video frame to extract red channel average
+    function processFrame() {
+      if (!processingVideo || !processingCanvas || !measuring || !stream || processingVideo.paused) return;
+      
+      const video = processingVideo;
+      const canvas = processingCanvas;
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      
+      // Ensure canvas size is correct
+      if (canvas.width !== 150 || canvas.height !== 150) {
+        canvas.width = 150;
+        canvas.height = 150;
+      }
+      
+      if (video.videoWidth > 0 && video.videoHeight > 0) {
+        // Draw center crop from video to canvas
+        const srcX = (video.videoWidth - canvas.width) / 2;
+        const srcY = (video.videoHeight - canvas.height) / 2;
+        ctx.drawImage(video, srcX, srcY, canvas.width, canvas.height, 0, 0, canvas.width, canvas.height);
+        
+        // Extract red values from center ROI
+        const roiX = canvas.width / 2 - 20;
+        const roiY = canvas.height / 2 - 20;
+        const roiWidth = 40;
+        const roiHeight = 40;
+        const pixelData = ctx.getImageData(roiX, roiY, roiWidth, roiHeight).data;
+        
+        // Calculate average red value
+        let totalRed = 0;
+        let pixelCount = 0;
+        for (let i = 0; i < pixelData.length; i += 4) {
+          totalRed += pixelData[i];
+          pixelCount++;
+        }
+        const avgRed = pixelCount > 0 ? totalRed / pixelCount : 0;
+        
+        // Add to buffer and maintain size
+        redValuesBuffer.push(avgRed);
+        if (redValuesBuffer.length > BUFFER_SIZE) {
+          redValuesBuffer.shift();
+        }
+        
+        // Update data for visualization
+        dataPoints = [...redValuesBuffer];
+        updateVisualization();
+      }
+      
+      // Draw ROI box on preview
+      if (previewCanvas) {
+        const previewCtx = previewCanvas.getContext('2d');
+        previewCtx.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
+        previewCtx.strokeStyle = 'red';
+        previewCtx.lineWidth = 2;
+        const previewRoiX = previewCanvas.width / 2 - 20;
+        const previewRoiY = previewCanvas.height / 2 - 20;
+        previewCtx.strokeRect(previewRoiX, previewRoiY, 40, 40);
+      }
+      
+      // Continue processing frames
+      frameProcessorId = requestAnimationFrame(processFrame);
+    }
+    
+    // Apply smoothing to signal
+    function smoothSignal(data) {
+      const result = [];
+      for (let i = 0; i < data.length; i++) {
+        let sum = 0;
+        let count = 0;
+        // Average nearby values
+        for (let j = Math.max(0, i - Math.floor(SMOOTHING_WINDOW_SIZE/2)); 
+             j <= Math.min(data.length - 1, i + Math.floor(SMOOTHING_WINDOW_SIZE/2)); 
+             j++) {
+          sum += data[j];
+          count++;
+        }
+        result.push(sum / count);
+      }
+      return result;
+    }
+    
+    // Calculate heart rate from red values
+    function calculateHeartRate() {
+      // Ensure we have enough data
+      if (redValuesBuffer.length < FPS * 3) {
+        return null;
+      }
+      
+      // Step 1: Smooth the signal to reduce noise
+      const smoothed = smoothSignal(redValuesBuffer);
+      
+      // Step 2: Normalize the signal
+      const mean = smoothed.reduce((sum, val) => sum + val, 0) / smoothed.length;
+      const normalized = smoothed.map(val => val - mean);
+      
+      // Step 3: Find peaks with reasonable threshold
+      const maxVal = Math.max(...normalized);
+      const threshold = maxVal * 0.25; // 25% of max value
+      
+      const peaks = [];
+      const minPeakDistance = Math.round(FPS * 60 / MAX_BPM * 0.8); // Min distance between peaks
+      
+      for (let i = 2; i < normalized.length - 2; i++) {
+        // Check if this point is a local maximum
+        if (normalized[i] > normalized[i-1] && 
+            normalized[i] > normalized[i-2] && 
+            normalized[i] > normalized[i+1] && 
+            normalized[i] > normalized[i+2] && 
+            normalized[i] > threshold) {
+          
+          // Only add peaks that are far enough from previous peak
+          if (peaks.length === 0 || i - peaks[peaks.length - 1] >= minPeakDistance) {
+            peaks.push(i);
+          }
+        }
+      }
+      
+      // Save peaks for visualization
+      detectedPeaks = peaks;
+      
+      // Need at least 2 peaks to calculate heart rate
+      if (peaks.length < 2) {
+        return null;
+      }
+      
+      // Step 4: Calculate intervals between peaks
+      const intervals = [];
+      for (let i = 1; i < peaks.length; i++) {
+        const interval = peaks[i] - peaks[i-1];
+        // Only include reasonable intervals
+        if (interval >= Math.round(FPS * 60 / MAX_BPM) && 
+            interval <= Math.round(FPS * 60 / MIN_BPM)) {
+          intervals.push(interval);
+        }
+      }
+      
+      if (intervals.length < 1) {
+        return null;
+      }
+      
+      // Step 5: Use median interval to calculate heart rate
+      intervals.sort((a, b) => a - b);
+      const medianInterval = intervals[Math.floor(intervals.length / 2)];
+      
+      // Convert to BPM: (60 seconds / interval in seconds)
+      const hr = Math.round((60 * FPS) / medianInterval);
+      
+      // Only return heart rate in reasonable range
+      return (hr >= MIN_BPM && hr <= MAX_BPM) ? hr : null;
+    }
+    
+    // Start measurement process
+    async function startMeasurement() {
+      await startPositioning();
+    }
+    
+    // Start a single measurement cycle
+    function startSingleMeasurement() {
+      // Update UI
+      countdownElement.textContent = `${measurementNumber}/${TOTAL_MEASUREMENTS}`;
+      updateMeasurementIndicators();
+      
+      // Reset data for this measurement
+      redValuesBuffer = [];
+      
+      // Start video processing
+      if (frameProcessorId) cancelAnimationFrame(frameProcessorId);
+      frameProcessorId = requestAnimationFrame(processFrame);
+      
+      // Schedule measurement completion
+      measurementTimer = setTimeout(() => {
+        // Stop frame processing
+        if (frameProcessorId) {
+          cancelAnimationFrame(frameProcessorId);
+          frameProcessorId = null;
+        }
+        
+        // Calculate heart rate
+        const hr = calculateHeartRate();
+        const newReading = (hr !== null) ? hr : FAILED_MEASUREMENT_TEXT;
+        individualReadings.push(newReading);
+        
+        // Update UI
+        updateReadings();
+        updateMeasurementIndicators();
+        
+        // Proceed to next measurement or finalize
+        if (measurementNumber < TOTAL_MEASUREMENTS) {
+          measurementNumber++;
+          setTimeout(() => startSingleMeasurement(), 1000);
+        } else {
+          finalizeMeasurements();
+        }
+      }, MEASUREMENT_DURATION * 1000);
+    }
+    
+    // Finalize all measurements and show results
+    function finalizeMeasurements() {
+      // Calculate final heart rate from valid readings
+      const validReadings = individualReadings.filter(r => 
+        typeof r === 'number' && r >= MIN_BPM && r <= MAX_BPM
+      );
+      
+      let finalHR;
+      if (validReadings.length > 0) {
+        const sortedReadings = [...validReadings].sort((a, b) => a - b);
+        finalHR = sortedReadings[Math.floor(sortedReadings.length / 2)]; // Median
+      } else {
+        finalHR = FAILED_MEASUREMENT_TEXT;
+      }
+      
+      heartRate = finalHR;
+      
+      // Calculate recommended tempo
+      if (typeof heartRate === 'number') {
+        recommendedTempo = Math.floor(heartRate * 0.7);
+        if (recommendedTempo < 50) recommendedTempo = 50; // Minimum practical tempo
+        
+        // Update UI
+        tempoValue.textContent = `${recommendedTempo} BPM`;
+        currentTempo.textContent = recommendedTempo;
+        startSessionBtn.disabled = false;
+        startSessionBtn.classList.remove('btn-disabled');
+      } else {
+        // Failed to get valid measurement
+        recommendedTempo = FAILED_MEASUREMENT_TEXT;
+        tempoValue.textContent = "N/A";
+        currentTempo.textContent = "N/A";
+        startSessionBtn.disabled = true;
+        startSessionBtn.classList.add('btn-disabled');
+      }
+      
+      // Update UI
+      heartRateValue.textContent = (typeof heartRate === 'number') ? 
+        `${heartRate} BPM` : "Measurement Failed";
+      updateResultReadings();
+      
+      measuringState.classList.add('hidden');
+      resultsState.classList.remove('hidden');
+      
+      stopMeasuring();
+    }
+    
+    // Stop measuring and clean up
+    function stopMeasuring() {
+      measuring = false;
+      
+      // Clear timers
+      if (countdownTimer) {
+        clearInterval(countdownTimer);
+        countdownTimer = null;
+      }
+      
+      if (measurementTimer) {
+        clearTimeout(measurementTimer);
+        measurementTimer = null;
+      }
+      
+      if (frameProcessorId) {
+        cancelAnimationFrame(frameProcessorId);
+        frameProcessorId = null;
+      }
+      
+      // Turn off flash
+      if (flashActive && stream) {
+        const track = stream.getVideoTracks()[0];
+        if (track) {
+          track.applyConstraints({ advanced: [{ torch: false }] });
+          flashActive = false;
+        }
+      }
+      
+      // Stop video stream
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+        stream = null;
+      }
+      
+      flashToggleBtn.classList.add('hidden');
+    }
+    
+    // Visualization
+    function updateVisualization() {
+      visualization.innerHTML = '';
+      
+      const displayPoints = dataPoints.slice(-100);
+      if (displayPoints.length === 0) return;
+      
+      // Find min/max for scaling
+      const minVal = Math.min(...displayPoints);
+      const maxVal = Math.max(...displayPoints);
+      const range = (maxVal - minVal) === 0 ? 1 : (maxVal - minVal);
+      
+      // Adjust peak indices for visualization
+      const visiblePeaks = [];
+      for (const peak of detectedPeaks) {
+        const adjustedIndex = peak - (redValuesBuffer.length - displayPoints.length);
+        if (adjustedIndex >= 0 && adjustedIndex < displayPoints.length) {
+          visiblePeaks.push(adjustedIndex);
+        }
+      }
+      
+      // Create visualization bars
+      for (let i = 0; i < displayPoints.length; i++) {
+        const value = displayPoints[i];
+        const normalizedValue = ((value - minVal) / range) * 100;
+        const height = Math.max(1, Math.min(100, normalizedValue));
+        
+        const bar = document.createElement('div');
+        bar.className = 'visualization-bar';
+        if (visiblePeaks.includes(i)) {
+          bar.classList.add('peak');
+        }
+        
+        bar.style.height = `${height}%`;
+        bar.style.left = `${(i / displayPoints.length) * 100}%`;
+        bar.style.width = `${Math.max(1, 100 / displayPoints.length)}%`;
+        
+        visualization.appendChild(bar);
+      }
+    }
+    
+    // Clear visualization
+    function clearVisualization() {
+      visualization.innerHTML = '';
+      dataPoints = [];
+    }
+    
+    // Update readings display
+    function updateReadings() {
+      readings.innerHTML = '';
+      
+      individualReadings.forEach((reading) => {
+        const readingElement = document.createElement('div');
+        readingElement.className = 'reading';
+        
+        if (reading === FAILED_MEASUREMENT_TEXT) {
+          readingElement.innerHTML = `<span class="reading-value">${FAILED_MEASUREMENT_TEXT}</span>`;
+        } else {
+          readingElement.innerHTML = `
+            <span class="reading-value">${reading}</span>
+            <span class="reading-unit">&nbsp;BPM</span>
+          `;
+        }
+        readings.appendChild(readingElement);
+      });
+    }
+    
+    // Clear readings display
+    function clearReadings() {
+      readings.innerHTML = '';
+    }
+    
+    // Update result readings display
+    function updateResultReadings() {
+      resultReadings.innerHTML = '';
+      
+      individualReadings.forEach((reading) => {
+        const readingElement = document.createElement('div');
+        readingElement.className = 'result-reading';
+        
+        if (reading === FAILED_MEASUREMENT_TEXT) {
+          readingElement.innerHTML = `
+            <svg class="icon icon-xs" viewBox="0 0 24 24" style="color: #ef4444; margin-right: 4px;">
+              <line x1="18" y1="6" x2="6" y2="18"></line>
+              <line x1="6" y1="6" x2="18" y2="18"></line>
+            </svg>
+            ${FAILED_MEASUREMENT_TEXT}
+          `;
+        } else {
+          readingElement.innerHTML = `
+            <svg class="icon icon-xs" viewBox="0 0 24 24" style="color: #10b981; margin-right: 4px;">
+              <polyline points="20 6 9 17 4 12"></polyline>
+            </svg>
+            ${reading} BPM
+          `;
+        }
+        
+        resultReadings.appendChild(readingElement);
+      });
+    }
+    
+    // Update measurement indicators
+    function updateMeasurementIndicators() {
+      const indicators = measurementIndicators.querySelectorAll('.indicator');
+      
+      for (let i = 0; i < indicators.length; i++) {
+        indicators[i].className = 'indicator'; // Reset classes
+        
+        if (i < individualReadings.length) { // Completed measurement
+          if (individualReadings[i] === FAILED_MEASUREMENT_TEXT) {
+            indicators[i].classList.add('failed');
+          } else {
+            indicators[i].classList.add('complete');
+          }
+        } else if (i === measurementNumber - 1 && measuring) { // Current measurement
+          indicators[i].classList.add('active');
+        }
+      }
+    }
+    
+    // Start meditation session
+    function startMeditation() {
+      if (typeof heartRate !== 'number' || meditationActive) return;
+      
+      meditationActive = true;
+      progress = 0;
+      
+      startSessionBtn.classList.add('hidden');
+      endSessionBtn.classList.remove('hidden');
+      meditationSection.classList.remove('hidden');
+      progressFill.style.width = '0%';
+      
+      const totalDuration = 10 * 60 * 1000; // 10 minutes
+      const updateInterval = totalDuration / 100; // Update every 1%
+      
+      animationId = setInterval(() => {
+        progress += 1;
+        progressFill.style.width = `${progress}%`;
+        
+        if (progress >= 100) {
+          endMeditation();
+        }
+      }, updateInterval);
+    }
+    
+    // End meditation session
+    function endMeditation() {
+      meditationActive = false;
+      
+      startSessionBtn.classList.remove('hidden');
+      endSessionBtn.classList.add('hidden');
+      
+      if (animationId) {
+        clearInterval(animationId);
+        animationId = null;
+      }
+    }
+    
+    // Event listeners
+    document.addEventListener('DOMContentLoaded', function() {
+      checkCameras();
+      
+      startMeasurementBtn.addEventListener('click', startMeasurement);
+      cameraToggle.addEventListener('click', toggleCamera);
+      flashToggleBtn.addEventListener('click', toggleFlash);
+      remeasureBtn.addEventListener('click', startMeasurement);
+      startSessionBtn.addEventListener('click', startMeditation);
+      endSessionBtn.addEventListener('click', endMeditation);
+      skipPositioningBtn.addEventListener('click', startMeasuring);
+    });
+    
+    // Clean up on page unload
+    window.addEventListener('beforeunload', function() {
+      if (positioning) stopPositioning();
+      if (measuring) stopMeasuring();
+      
+      if (flashActive && stream) {
+        const track = stream.getVideoTracks()[0];
+        if (track) {
+          track.applyConstraints({ advanced: [{ torch: false }] });
+        }
+      }
+      
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+      }
+      
+      if (frameProcessorId) cancelAnimationFrame(frameProcessorId);
+      if (countdownTimer) clearInterval(countdownTimer);
+      if (measurementTimer) clearTimeout(measurementTimer);
+      if (animationId) clearInterval(animationId);
+    });
+  </script>
+</body>
+</html>
