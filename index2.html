@@ -840,19 +840,19 @@
         const mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
         stream = mediaStream;
         
-        // Set video sources for all video elements
+        // Set video sources for all video elements based on current state
         if (positioning) {
           processingVideo.srcObject = mediaStream;
           previewVideo.srcObject = mediaStream;
           
-          await processingVideo.play();
-          await previewVideo.play();
+          await processingVideo.play().catch(e => console.error("Error playing processingVideo:", e));
+          await previewVideo.play().catch(e => console.error("Error playing previewVideo:", e));
         } else if (measuring) {
           processingVideo.srcObject = mediaStream;
           measureVideo.srcObject = mediaStream;
           
-          await processingVideo.play();
-          await measureVideo.play();
+          await processingVideo.play().catch(e => console.error("Error playing processingVideo:", e));
+          await measureVideo.play().catch(e => console.error("Error playing measureVideo:", e));
         }
         
         // Check flash support
@@ -1137,7 +1137,12 @@
     // Start the actual measurement phase
     function startMeasuring() {
       // Stop positioning phase
-      stopPositioning();
+      positioning = false;
+      
+      if (frameProcessorId) {
+        cancelAnimationFrame(frameProcessorId);
+        frameProcessorId = null;
+      }
       
       // Initialize measurement state
       measuring = true;
@@ -1147,6 +1152,7 @@
       measurementNumber = 0;
       individualReadings = [];
       detectedPeaks = [];
+      lastVisibleBpm = null;
       
       // Update UI
       positioningState.classList.add('hidden');
@@ -1157,6 +1163,12 @@
       clearVisualization();
       updateMeasurementIndicators();
       clearReadings();
+      
+      // Important: Stop and restart the video stream to ensure proper transition
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+        stream = null;
+      }
       
       // Start camera for measurement
       startCameraWithFacing(cameraFacing).then(success => {
@@ -1185,6 +1197,12 @@
             startSingleMeasurement();
           }
         }, 1000);
+      }).catch(error => {
+        console.error("Error starting camera for measuring:", error);
+        stopMeasuring();
+        initialState.classList.remove('hidden');
+        measuringState.classList.add('hidden');
+        showCameraError("Failed to start camera for measurement");
       });
     }
     
@@ -1196,9 +1214,17 @@
       
       // Reset data for this measurement
       redValuesBuffer = [];
+      detectedPeaks = [];
       
       // Start video processing
-      if (frameProcessorId) cancelAnimationFrame(frameProcessorId);
+      if (frameProcessorId) {
+        cancelAnimationFrame(frameProcessorId);
+        frameProcessorId = null;
+      }
+      
+      console.log("Starting measurement cycle", measurementNumber);
+      
+      // Restart frame processor
       frameProcessorId = requestAnimationFrame(processFrame);
       
       // Schedule measurement completion
@@ -1209,10 +1235,14 @@
           frameProcessorId = null;
         }
         
+        console.log("Measurement cycle complete, calculating heart rate...");
+        
         // Calculate heart rate
         const hr = calculateHeartRate();
         const newReading = (hr !== null) ? hr : FAILED_MEASUREMENT_TEXT;
         individualReadings.push(newReading);
+        
+        console.log("Heart rate calculated:", newReading);
         
         // Update UI
         updateReadings();
@@ -1221,8 +1251,10 @@
         // Proceed to next measurement or finalize
         if (measurementNumber < TOTAL_MEASUREMENTS) {
           measurementNumber++;
+          console.log("Moving to next measurement:", measurementNumber);
           setTimeout(() => startSingleMeasurement(), 1000);
         } else {
+          console.log("All measurements complete, finalizing results");
           finalizeMeasurements();
         }
       }, MEASUREMENT_DURATION * 1000);
@@ -1230,64 +1262,77 @@
     
     // Process video frame to extract red channel average
     function processFrame() {
-      if (!processingVideo || !processingCanvas || !measuring || !stream || processingVideo.paused) return;
-      
-      const video = processingVideo;
-      const canvas = processingCanvas;
-      const ctx = canvas.getContext('2d', { willReadFrequently: true });
-      
-      // Ensure canvas size is correct
-      if (canvas.width !== 150 || canvas.height !== 150) {
-        canvas.width = 150;
-        canvas.height = 150;
+      if (!processingVideo || !processingCanvas || !measuring || !stream || processingVideo.paused) {
+        console.log("Skipping processFrame due to invalid state");
+        return;
       }
       
-      if (video.videoWidth > 0 && video.videoHeight > 0) {
-        // Draw center crop from video to canvas
-        const srcX = (video.videoWidth - canvas.width) / 2;
-        const srcY = (video.videoHeight - canvas.height) / 2;
-        ctx.drawImage(video, srcX, srcY, canvas.width, canvas.height, 0, 0, canvas.width, canvas.height);
+      try {
+        const video = processingVideo;
+        const canvas = processingCanvas;
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
         
-        // Extract red values from center ROI
-        const roiX = canvas.width / 2 - 20;
-        const roiY = canvas.height / 2 - 20;
-        const roiWidth = 40;
-        const roiHeight = 40;
-        const pixelData = ctx.getImageData(roiX, roiY, roiWidth, roiHeight).data;
-        
-        // Calculate average red value
-        let totalRed = 0;
-        let pixelCount = 0;
-        for (let i = 0; i < pixelData.length; i += 4) {
-          totalRed += pixelData[i];
-          pixelCount++;
-        }
-        const avgRed = pixelCount > 0 ? totalRed / pixelCount : 0;
-        
-        // Add to buffer and maintain size
-        redValuesBuffer.push(avgRed);
-        if (redValuesBuffer.length > BUFFER_SIZE) {
-          redValuesBuffer.shift();
+        // Ensure canvas size is correct
+        if (canvas.width !== 150 || canvas.height !== 150) {
+          canvas.width = 150;
+          canvas.height = 150;
         }
         
-        // Update data for visualization
-        dataPoints = [...redValuesBuffer];
-        updateVisualization();
+        if (video.videoWidth > 0 && video.videoHeight > 0) {
+          // Draw center crop from video to canvas
+          const srcX = (video.videoWidth - canvas.width) / 2;
+          const srcY = (video.videoHeight - canvas.height) / 2;
+          ctx.drawImage(video, srcX, srcY, canvas.width, canvas.height, 0, 0, canvas.width, canvas.height);
+          
+          // Extract red values from center ROI
+          const roiX = canvas.width / 2 - 20;
+          const roiY = canvas.height / 2 - 20;
+          const roiWidth = 40;
+          const roiHeight = 40;
+          const pixelData = ctx.getImageData(roiX, roiY, roiWidth, roiHeight).data;
+          
+          // Calculate average red value
+          let totalRed = 0;
+          let pixelCount = 0;
+          for (let i = 0; i < pixelData.length; i += 4) {
+            totalRed += pixelData[i];
+            pixelCount++;
+          }
+          const avgRed = pixelCount > 0 ? totalRed / pixelCount : 0;
+          
+          // Add to buffer and maintain size
+          redValuesBuffer.push(avgRed);
+          if (redValuesBuffer.length > BUFFER_SIZE) {
+            redValuesBuffer.shift();
+          }
+          
+          // Update data for visualization
+          dataPoints = [...redValuesBuffer];
+          updateVisualization();
+        }
+        
+        // Draw ROI box on measurement preview
+        if (measureCanvas) {
+          const measureCtx = measureCanvas.getContext('2d');
+          measureCtx.clearRect(0, 0, measureCanvas.width, measureCanvas.height);
+          measureCtx.strokeStyle = 'red';
+          measureCtx.lineWidth = 2;
+          const measureRoiX = measureCanvas.width / 2 - 20;
+          const measureRoiY = measureCanvas.height / 2 - 20;
+          measureCtx.strokeRect(measureRoiX, measureRoiY, 40, 40);
+        }
+        
+        // Continue processing frames if still measuring
+        if (measuring) {
+          frameProcessorId = requestAnimationFrame(processFrame);
+        }
+      } catch (err) {
+        console.error("Error in processFrame:", err);
+        // Try to continue despite error
+        if (measuring) {
+          frameProcessorId = requestAnimationFrame(processFrame);
+        }
       }
-      
-      // Draw ROI box on measurement preview
-      if (measureCanvas) {
-        const measureCtx = measureCanvas.getContext('2d');
-        measureCtx.clearRect(0, 0, measureCanvas.width, measureCanvas.height);
-        measureCtx.strokeStyle = 'red';
-        measureCtx.lineWidth = 2;
-        const measureRoiX = measureCanvas.width / 2 - 20;
-        const measureRoiY = measureCanvas.height / 2 - 20;
-        measureCtx.strokeRect(measureRoiX, measureRoiY, 40, 40);
-      }
-      
-      // Continue processing frames
-      frameProcessorId = requestAnimationFrame(processFrame);
     }
     
     // Stop measuring and clean up
@@ -1648,122 +1693,128 @@
       const displayPoints = dataPoints.slice(-100);
       if (displayPoints.length < 2) return;
       
-      // Process points for better visualization
-      const processed = processSignal(displayPoints);
-      
-      // Find min/max for scaling
-      const minVal = Math.min(...processed);
-      const maxVal = Math.max(...processed);
-      const range = (maxVal - minVal) === 0 ? 1 : (maxVal - minVal);
-      
-      // Create the path for the line
-      const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
-      
-      // Build path data
-      let pathData = "";
-      
-      for (let i = 0; i < processed.length; i++) {
-        // Scale x from 0-100% of width
-        const x = (i / (processed.length - 1)) * 100;
+      try {
+        // Process points for better visualization
+        const processed = processSignal(displayPoints);
         
-        // Scale y from 10-90% of height (inverted, as SVG y increases downward)
-        const y = 90 - ((processed[i] - minVal) / range) * 80;
+        // Find min/max for scaling
+        const minVal = Math.min(...processed);
+        const maxVal = Math.max(...processed);
+        const range = (maxVal - minVal) === 0 ? 1 : (maxVal - minVal);
         
-        if (i === 0) {
-          pathData += `M ${x} ${y}`;
-        } else {
-          pathData += ` L ${x} ${y}`;
+        // Create the path for the line
+        const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        
+        // Build path data
+        let pathData = "";
+        
+        for (let i = 0; i < processed.length; i++) {
+          // Scale x from 0-100% of width
+          const x = (i / (processed.length - 1)) * 100;
+          
+          // Scale y from 10-90% of height (inverted, as SVG y increases downward)
+          const y = 90 - ((processed[i] - minVal) / range) * 80;
+          
+          if (i === 0) {
+            pathData += `M ${x} ${y}`;
+          } else {
+            pathData += ` L ${x} ${y}`;
+          }
         }
+        
+        path.setAttribute("d", pathData);
+        path.setAttribute("fill", "none");
+        path.setAttribute("stroke", "#ef4444");  // Red line
+        path.setAttribute("stroke-width", "2");
+        path.setAttribute("vector-effect", "non-scaling-stroke");
+        
+        svg.appendChild(path);
+        
+        // Add visual indicators for detected peaks
+        if (measuring && detectedPeaks && detectedPeaks.length > 0) {
+          // Calculate the most recent peak
+          const lastPeak = detectedPeaks[detectedPeaks.length - 1];
+          const bufferLength = redValuesBuffer.length;
+          
+          // Check if the peak was recent (in last 0.5 seconds)
+          if (lastPeak > bufferLength - (FPS * 0.5)) {
+            // Find beat indicator
+            let beatIndicator = document.getElementById('beatIndicator');
+            
+            if (beatIndicator) {
+              // Trigger beat animation
+              beatIndicator.classList.remove('pulse');
+              void beatIndicator.offsetWidth; // Force reflow
+              beatIndicator.classList.add('pulse');
+            }
+            
+            // Show current BPM if we have at least two peaks
+            if (detectedPeaks.length >= 2 && lastVisibleBpm) {
+              const bpmText = document.createElement('div');
+              bpmText.style.color = '#fff';
+              bpmText.style.position = 'absolute';
+              bpmText.style.bottom = '5px';
+              bpmText.style.left = '10px';
+              bpmText.style.fontSize = '0.75rem';
+              bpmText.textContent = `${lastVisibleBpm} bpm`;
+              container.appendChild(bpmText);
+            }
+          }
+        }
+        
+        // Add marker points for peaks
+        if (detectedPeaks) {
+          const visiblePeaks = [];
+          
+          // Adjust peak indices to match display points
+          for (const peak of detectedPeaks) {
+            const adjustedPeak = peak - (redValuesBuffer.length - displayPoints.length);
+            if (adjustedPeak >= 0 && adjustedPeak < displayPoints.length) {
+              visiblePeaks.push(adjustedPeak);
+            }
+          }
+          
+          // Draw circles at peak positions
+          for (const peakIndex of visiblePeaks) {
+            const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+            
+            const x = (peakIndex / (processed.length - 1)) * 100;
+            const y = 90 - ((processed[peakIndex] - minVal) / range) * 80;
+            
+            circle.setAttribute("cx", x);
+            circle.setAttribute("cy", y);
+            circle.setAttribute("r", "2");
+            circle.setAttribute("fill", "#10b981"); // Green dots for peaks
+            
+            svg.appendChild(circle);
+          }
+          
+          // Display current visible BPM
+          if (visiblePeaks.length >= 2) {
+            const visibleIntervals = [];
+            for (let i = 1; i < visiblePeaks.length; i++) {
+              visibleIntervals.push(visiblePeaks[i] - visiblePeaks[i-1]);
+            }
+            
+            if (visibleIntervals.length > 0) {
+              visibleIntervals.sort((a, b) => a - b);
+              const medianVisibleInterval = visibleIntervals[Math.floor(visibleIntervals.length / 2)];
+              lastVisibleBpm = Math.round((60 * FPS) / medianVisibleInterval);
+            }
+          }
+        }
+        
+        container.appendChild(svg);
+      } catch (err) {
+        console.error("Error in visualization:", err);
+        // Fallback to simple visualization
+        const errorMessage = document.createElement('div');
+        errorMessage.textContent = "Visualizing signal...";
+        errorMessage.style.color = '#666';
+        errorMessage.style.textAlign = 'center';
+        errorMessage.style.paddingTop = '20px';
+        container.appendChild(errorMessage);
       }
-      
-      path.setAttribute("d", pathData);
-      path.setAttribute("fill", "none");
-      path.setAttribute("stroke", "#ef4444");  // Red line
-      path.setAttribute("stroke-width", "2");
-      path.setAttribute("vector-effect", "non-scaling-stroke");
-      
-      svg.appendChild(path);
-      
-      // Add visual indicators for detected peaks
-      if (measuring && detectedPeaks && detectedPeaks.length > 0) {
-        // Calculate the most recent peak
-        const lastPeak = detectedPeaks[detectedPeaks.length - 1];
-        const bufferLength = redValuesBuffer.length;
-        
-        // Check if the peak was recent (in last 0.5 seconds)
-        if (lastPeak > bufferLength - (FPS * 0.5)) {
-          // Create or update beat indicator
-          let beatIndicator = document.getElementById('beatIndicator');
-          
-          if (!beatIndicator) {
-            beatIndicator = document.createElement('div');
-            beatIndicator.id = 'beatIndicator';
-            beatIndicator.className = 'beat-indicator';
-            document.body.appendChild(beatIndicator);
-          }
-          
-          // Trigger beat animation
-          beatIndicator.classList.remove('pulse');
-          void beatIndicator.offsetWidth; // Force reflow
-          beatIndicator.classList.add('pulse');
-          
-          // Show current BPM if we have at least two peaks
-          if (detectedPeaks.length >= 2 && lastVisibleBpm) {
-            const bpmText = document.createElement('div');
-            bpmText.style.color = '#fff';
-            bpmText.style.position = 'absolute';
-            bpmText.style.bottom = '5px';
-            bpmText.style.left = '10px';
-            bpmText.style.fontSize = '0.75rem';
-            bpmText.textContent = `${lastVisibleBpm} bpm`;
-            container.appendChild(bpmText);
-          }
-        }
-      }
-      
-      // Add marker points for peaks
-      if (detectedPeaks) {
-        const visiblePeaks = [];
-        
-        // Adjust peak indices to match display points
-        for (const peak of detectedPeaks) {
-          const adjustedPeak = peak - (redValuesBuffer.length - displayPoints.length);
-          if (adjustedPeak >= 0 && adjustedPeak < displayPoints.length) {
-            visiblePeaks.push(adjustedPeak);
-          }
-        }
-        
-        // Draw circles at peak positions
-        for (const peakIndex of visiblePeaks) {
-          const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-          
-          const x = (peakIndex / (processed.length - 1)) * 100;
-          const y = 90 - ((processed[peakIndex] - minVal) / range) * 80;
-          
-          circle.setAttribute("cx", x);
-          circle.setAttribute("cy", y);
-          circle.setAttribute("r", "2");
-          circle.setAttribute("fill", "#10b981"); // Green dots for peaks
-          
-          svg.appendChild(circle);
-        }
-        
-        // Display current visible BPM
-        if (visiblePeaks.length >= 2) {
-          const visibleIntervals = [];
-          for (let i = 1; i < visiblePeaks.length; i++) {
-            visibleIntervals.push(visiblePeaks[i] - visiblePeaks[i-1]);
-          }
-          
-          if (visibleIntervals.length > 0) {
-            visibleIntervals.sort((a, b) => a - b);
-            const medianVisibleInterval = visibleIntervals[Math.floor(visibleIntervals.length / 2)];
-            lastVisibleBpm = Math.round((60 * FPS) / medianVisibleInterval);
-          }
-        }
-      }
-      
-      container.appendChild(svg);
     }
     
     // Clear visualization
